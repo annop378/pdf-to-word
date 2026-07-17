@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF to Word Converter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.10);
+      padding: 40px 48px;
+      width: 480px;
+      max-width: 95vw;
+    }
+
+    h1 { font-size: 1.5rem; margin-bottom: 8px; color: #1a1a2e; }
+    .subtitle { color: #6b7280; font-size: .9rem; margin-bottom: 28px; }
+
+    .drop-zone {
+      border: 2px dashed #c7d2fe;
+      border-radius: 10px;
+      padding: 36px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      color: #6b7280;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #6366f1;
+      background: #eef2ff;
+    }
+    .drop-zone .icon { font-size: 2.5rem; margin-bottom: 10px; }
+    .drop-zone p { font-size: .9rem; }
+    .drop-zone strong { color: #6366f1; }
+
+    #file-input { display: none; }
+
+    #file-name {
+      margin-top: 12px;
+      font-size: .85rem;
+      color: #374151;
+      min-height: 20px;
+      text-align: center;
+    }
+
+    button {
+      margin-top: 24px;
+      width: 100%;
+      padding: 12px;
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    button:hover:not(:disabled) { background: #4f46e5; }
+    button:disabled { background: #a5b4fc; cursor: not-allowed; }
+
+    #status {
+      margin-top: 18px;
+      font-size: .9rem;
+      text-align: center;
+      min-height: 24px;
+    }
+    #status.error { color: #dc2626; }
+    #status.success { color: #16a34a; }
+
+    #download-link {
+      display: none;
+      margin-top: 14px;
+      text-align: center;
+    }
+    #download-link a {
+      display: inline-block;
+      padding: 10px 28px;
+      background: #16a34a;
+      color: #fff;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: .9rem;
+      transition: background .2s;
+    }
+    #download-link a:hover { background: #15803d; }
+
+    .spinner {
+      display: inline-block;
+      width: 16px; height: 16px;
+      border: 2px solid #fff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>PDF → Word Converter</h1>
+  <p class="subtitle">Upload a PDF (text or scanned). Tables are detected automatically.</p>
+
+  <div class="drop-zone" id="drop-zone">
+    <div class="icon">📄</div>
+    <p>Drag &amp; drop your PDF here<br/>or <strong>click to browse</strong></p>
+  </div>
+  <input type="file" id="file-input" accept=".pdf" />
+  <div id="file-name"></div>
+
+  <button id="convert-btn" disabled>Convert to Word</button>
+
+  <div id="status"></div>
+  <div id="download-link"><a id="dl-anchor" href="#">⬇ Download .docx</a></div>
+</div>
+
+<script>
+  const dropZone    = document.getElementById("drop-zone");
+  const fileInput   = document.getElementById("file-input");
+  const fileNameEl  = document.getElementById("file-name");
+  const convertBtn  = document.getElementById("convert-btn");
+  const statusEl    = document.getElementById("status");
+  const dlSection   = document.getElementById("download-link");
+  const dlAnchor    = document.getElementById("dl-anchor");
+
+  let selectedFile = null;
+
+  function setFile(file) {
+    if (!file || !file.name.toLowerCase().endsWith(".pdf")) {
+      statusEl.textContent = "Please select a valid PDF file.";
+      statusEl.className = "error";
+      return;
+    }
+    selectedFile = file;
+    fileNameEl.textContent = `Selected: ${file.name}`;
+    convertBtn.disabled = false;
+    statusEl.textContent = "";
+    statusEl.className = "";
+    dlSection.style.display = "none";
+  }
+
+  dropZone.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+
+  dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault();
+    dropZone.classList.remove("dragover");
+    setFile(e.dataTransfer.files[0]);
+  });
+
+  convertBtn.addEventListener("click", async () => {
+    if (!selectedFile) return;
+
+    convertBtn.disabled = true;
+    convertBtn.innerHTML = '<span class="spinner"></span>Converting…';
+    statusEl.textContent = "";
+    statusEl.className = "";
+    dlSection.style.display = "none";
+
+    const form = new FormData();
+    form.append("file", selectedFile);
+
+    try {
+      const res = await fetch("/convert", { method: "POST", body: form });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.detail || "Conversion failed.");
+      }
+
+      statusEl.textContent = "Conversion successful!";
+      statusEl.className = "success";
+      dlAnchor.href = data.download_url;
+      dlAnchor.download = data.filename;
+      dlSection.style.display = "block";
+    } catch (err) {
+      statusEl.textContent = err.message;
+      statusEl.className = "error";
+    } finally {
+      convertBtn.disabled = false;
+      convertBtn.textContent = "Convert to Word";
+    }
+  });
+</script>
+</body>
+</html>
