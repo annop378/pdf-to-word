@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -11,8 +12,10 @@ from converter import convert_pdf_to_word
 
 app = FastAPI(title="PDF to Word Converter")
 
-STATIC_DIR = Path(__file__).parent / "static"
-TEMPLATES_DIR = STATIC_DIR / "templates"
+# PyInstaller 打包後資源放在 sys._MEIPASS，開發時維持 __file__ 相對路徑
+_BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+STATIC_DIR = _BASE / "static"
+TEMPLATES_DIR = _BASE / "static" / "templates"
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "pdf2word_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
