@@ -95,7 +95,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Document to Word Converter")
         self.resizable(False, False)
-        self._ai_model_var  = tk.StringVar()
+        self._ai_model_var  = tk.StringVar(value="claude-haiku-4-5-20251001")
         self._last_docx_path = None
         self._load_ai_config()
         self._build()
@@ -124,8 +124,6 @@ class App(tk.Tk):
         self._btn = tk.Button(row_btn, text="Convert", width=20,
                               command=self._start, state="disabled")
         self._btn.pack(side="left")
-        tk.Button(row_btn, text="⚙ AI 設定", width=10,
-                  command=self._open_ai_settings).pack(side="left", padx=(8, 0))
 
         # ── status bar ───────────────────────────────────────
         self._status = tk.StringVar(
@@ -144,8 +142,6 @@ class App(tk.Tk):
         self._ai_btn = tk.Button(row_ai, text="🤖 AI 分析文件", width=18,
                                  command=self._start_ai_analyze, state="disabled")
         self._ai_btn.pack(side="left")
-        tk.Button(row_ai, text="✏ Prompt", width=10,
-                  command=self._open_prompt_editor).pack(side="left", padx=(8, 0))
 
     def _pick(self):
         path = filedialog.askopenfilename(
@@ -198,7 +194,7 @@ class App(tk.Tk):
         if _AI_CONFIG_PATH.exists():
             try:
                 cfg = json.loads(_AI_CONFIG_PATH.read_text(encoding="utf-8"))
-                self._ai_model_var.set(cfg.get("claude_model", ""))
+                self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-4-5-20251001"))
             except Exception:
                 pass
 
