@@ -49,23 +49,146 @@ _PRESET_MODELS = [
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 ]
 
+_AI_FIX_PROMPT = """\
+你是文件校對助手。以下是由 PDF 轉換而來的 Word 文件內容，每一行對應文件中的一個段落或欄位。請找出並修正：
+
+1. **拼字錯誤**：明顯的錯字、多字、少字、OCR 辨識錯誤（如「0」vs「O」、「l」vs「1」、「rn」vs「m」）
+2. **標點符號問題**：多餘或缺少的標點符號
+3. **文字黏連**：換行錯誤導致的詞語黏在一起
+
+請直接輸出 JSON，不要有任何其他說明文字，格式如下：
+{
+  "corrections": [
+    {
+      "original": "原始錯誤文字（必須是單一段落內的原文，不可跨行，保留原始空格）",
+      "corrected": "修正後文字",
+      "reason": "修正原因"
+    }
+  ],
+  "summary": "修正項目總數與簡短說明"
+}
+
+注意：
+- original 必須是文件中單一行（段落）內實際存在的原文，不可包含換行符
+- 保留原文的空格格式，不要自行新增或刪除空格
+- 只列出確定錯誤的項目，不確定的不要列
+- 若無需修正，corrections 設為空陣列 []"""
+
 
 def _extract_docx_text(docx_bytes: bytes) -> str:
-    """從 docx bytes 提取純文字，供 AI 分析。段落與表格分開提取。"""
-    import io as _io
+    """
+    從 docx bytes 提取純文字，供 AI 分析。
+    每個段落獨立一行，去重合併儲存格，並正規化多餘空白。
+    """
+    import io as _io, re as _re
     from docx import Document as _Document
     doc = _Document(_io.BytesIO(docx_bytes))
     parts = []
-    for para in doc.paragraphs:
-        t = para.text.strip()
+
+    def _add(text: str):
+        t = _re.sub(r'\s+', ' ', text).strip()
         if t:
             parts.append(t)
+
+    for para in doc.paragraphs:
+        _add(para.text)
+
+    seen_cells: set = set()
     for table in doc.tables:
         for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
+            for cell in row.cells:
+                cid = id(cell._tc)
+                if cid in seen_cells:
+                    continue
+                seen_cells.add(cid)
+                for para in cell.paragraphs:
+                    _add(para.text)
+
     return "\n".join(parts)
+
+
+def _apply_text_corrections(docx_bytes: bytes, correction_list: list) -> tuple:
+    """
+    套用 AI JSON 修正至 docx。
+    回傳 (corrected_bytes, applied_count, not_found_originals)。
+    以 regex 彈性匹配多餘空白（Word run 每個字後加空格造成）。
+    """
+    import io as _io, re as _re
+    from docx import Document as _Document
+
+    doc = _Document(_io.BytesIO(docx_bytes))
+    applied = 0
+    not_found: list = []
+
+    def _norm(s: str) -> str:
+        return _re.sub(r'\s+', ' ', s).strip()
+
+    def _build_pattern(norm_orig: str) -> str:
+        return r'\s+'.join(_re.escape(w) for w in norm_orig.split())
+
+    def _fix_para(para, norm_orig: str, corr: str, pattern: str) -> bool:
+        nonlocal applied
+        if _norm(para.text) and norm_orig not in _norm(para.text):
+            return False
+        # 先嘗試單一 run 匹配
+        for run in para.runs:
+            if _re.search(pattern, run.text):
+                run.text = _re.sub(pattern, corr, run.text, count=1)
+                applied += 1
+                return True
+        # 跨 run 情況：折疊至第一個 run
+        new_text = _re.sub(pattern, corr, para.text, count=1)
+        if new_text != para.text and para.runs:
+            para.runs[0].text = new_text
+            for r in para.runs[1:]:
+                r.text = ""
+            applied += 1
+            return True
+        return False
+
+    seen_cells: set = set()
+    for entry in correction_list:
+        orig = entry.get("original", "").strip()
+        repl = entry.get("corrected", "").strip()
+        if not orig or orig == repl:
+            continue
+        norm_orig = _norm(orig)
+        if not norm_orig:
+            continue
+        pattern = _build_pattern(norm_orig)
+        found = False
+
+        for para in doc.paragraphs:
+            if _fix_para(para, norm_orig, repl, pattern):
+                found = True
+                break
+
+        if not found:
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        cid = id(cell._tc)
+                        if cid in seen_cells:
+                            continue
+                        seen_cells.add(cid)
+                        for para in cell.paragraphs:
+                            if _fix_para(para, norm_orig, repl, pattern):
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            seen_cells.clear()
+
+        if not found:
+            not_found.append(orig)
+
+    buf = _io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue(), applied, not_found
 
 
 def _label_for(path: Path) -> str:
@@ -95,7 +218,8 @@ class App(tk.Tk):
         super().__init__()
         self.title("Document to Word Converter")
         self.resizable(False, False)
-        self._ai_model_var  = tk.StringVar(value="claude-haiku-4-5-20251001")
+        self._ai_model_var   = tk.StringVar(value="claude-haiku-4-5-20251001")
+        self._auto_fix_var   = tk.BooleanVar(value=False)
         self._last_docx_path = None
         self._load_ai_config()
         self._build()
@@ -124,6 +248,9 @@ class App(tk.Tk):
         self._btn = tk.Button(row_btn, text="Convert", width=20,
                               command=self._start, state="disabled")
         self._btn.pack(side="left")
+        ttk.Checkbutton(row_btn, text="轉換後自動修正拼字",
+                        variable=self._auto_fix_var,
+                        command=self._on_auto_fix_toggle).pack(side="left", padx=(10, 0))
 
         # ── status bar ───────────────────────────────────────
         self._status = tk.StringVar(
@@ -177,11 +304,127 @@ class App(tk.Tk):
         except Exception as exc:
             self.after(0, self._error, str(exc))
 
+    def _show_save_result(self, title: str, message: str, out_path: str):
+        """顯示儲存結果對話框，並自動開啟資料夾（Explorer 選取該檔案）。"""
+        # 自動開啟 Explorer 並選取檔案
+        try:
+            import subprocess as _sp
+            _sp.Popen(["explorer", "/select,", str(out_path).replace("/", "\\")])
+        except Exception:
+            pass
+
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+
+        tk.Label(dlg, text=message, wraplength=420, justify="left",
+                 padx=16, pady=12).grid(row=0, column=0, sticky="ew")
+
+        btn_f = tk.Frame(dlg)
+        btn_f.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="e")
+
+        def _open_file():
+            try:
+                os.startfile(out_path)
+            except Exception:
+                pass
+            dlg.destroy()
+
+        tk.Button(btn_f, text="開啟檔案", width=12, command=_open_file).pack(
+            side="left", padx=(0, 4))
+        tk.Button(btn_f, text="關閉", width=8, command=dlg.destroy).pack(side="left")
+
+        dlg.after(100, lambda: dlg.lift())
+
+    def _on_auto_fix_toggle(self):
+        """勾選「自動修正拼字」時，立即開啟 AI 設定並驗證連線。"""
+        if self._auto_fix_var.get():
+            self._open_ai_settings()
+
     def _done(self, out_path: str):
-        self._status.set("Done! Saved to: " + out_path)
         self._btn.config(state="normal")
         self._ai_btn.config(state="normal")
-        messagebox.showinfo("Conversion complete", f"Saved to:\n{out_path}")
+        if self._auto_fix_var.get():
+            self._status.set("轉換完成，AI 修正拼字中…")
+            self._btn.config(state="disabled")
+            self._ai_btn.config(state="disabled")
+            self._run_auto_fix_silent(out_path)
+        else:
+            self._status.set("Done! Saved to: " + out_path)
+            self._show_save_result(
+                "Conversion complete",
+                f"轉換完成，已儲存至：\n{out_path}",
+                out_path,
+            )
+
+    def _run_auto_fix_silent(self, base_path: str):
+        """轉換後自動執行 AI 拼字修正（靜默模式，不開 popup）。"""
+        try:
+            doc_bytes = Path(base_path).read_bytes()
+        except Exception as e:
+            self._status.set(f"轉換完成，讀取失敗：{e}")
+            self._btn.config(state="normal")
+            self._ai_btn.config(state="normal")
+            return
+        doc_text = _extract_docx_text(doc_bytes)
+        if not doc_text.strip():
+            self._status.set(f"轉換完成（無文字可修正）：{base_path}")
+            self._btn.config(state="normal")
+            self._ai_btn.config(state="normal")
+            return
+        full_prompt = f"{_AI_FIX_PROMPT}\n\n=== 文件內容 ===\n{doc_text[:8000]}"
+
+        def on_fix_done(raw_text):
+            import json as _json, re as _re
+            json_match = _re.search(r'\{[\s\S]*\}', raw_text)
+            if not json_match:
+                self._status.set(f"轉換完成（AI 修正回應無效）：{base_path}")
+                self._btn.config(state="normal")
+                self._ai_btn.config(state="normal")
+                return
+            try:
+                corrections = _json.loads(json_match.group()).get("corrections", [])
+            except Exception:
+                self._status.set(f"轉換完成（AI 修正 JSON 解析失敗）：{base_path}")
+                self._btn.config(state="normal")
+                self._ai_btn.config(state="normal")
+                return
+            if not corrections:
+                self._status.set(f"轉換完成（AI 未發現拼字錯誤）：{base_path}")
+                self._btn.config(state="normal")
+                self._ai_btn.config(state="normal")
+                return
+            try:
+                corrected_bytes, applied, _ = _apply_text_corrections(doc_bytes, corrections)
+            except Exception as e:
+                self._status.set(f"轉換完成（修正套用失敗：{e}）：{base_path}")
+                self._btn.config(state="normal")
+                self._ai_btn.config(state="normal")
+                return
+            orig_path = Path(base_path)
+            out_path = orig_path.with_stem(orig_path.stem + "_corrected")
+            try:
+                out_path.write_bytes(corrected_bytes)
+                self._last_docx_path = str(out_path)
+                self._status.set(f"完成！已修正 {applied}/{len(corrections)} 項 → {out_path.name}")
+                self._show_save_result(
+                    "轉換並修正完成",
+                    f"原始檔：{orig_path.name}\n修正版：{out_path.name}\n\n套用 {applied}/{len(corrections)} 項拼字修正",
+                    str(out_path),
+                )
+            except Exception as e:
+                self._status.set(f"修正版儲存失敗：{e}")
+            self._btn.config(state="normal")
+            self._ai_btn.config(state="normal")
+
+        def on_fix_error(text):
+            self._status.set(f"轉換完成（AI 修正失敗）：{base_path}")
+            self._btn.config(state="normal")
+            self._ai_btn.config(state="normal")
+
+        self._run_claude_async(full_prompt, on_fix_done, on_fix_error)
 
     def _error(self, msg: str):
         self._status.set("Error: " + msg)
@@ -439,6 +682,112 @@ class App(tk.Tk):
             self._run_claude_async(full_prompt, on_result, on_error, on_chunk=on_chunk)
 
         analyze_btn.config(command=do_analyze)
+
+        # ── 修正拼字功能 ──────────────────────────────
+        def do_fix():
+            if not self._last_docx_path:
+                on_error("❌ 尚未轉換任何文件，請先完成轉換。")
+                return
+            try:
+                doc_bytes = Path(self._last_docx_path).read_bytes()
+            except Exception as e:
+                on_error(f"❌ 無法讀取檔案：{e}")
+                return
+
+            doc_text = _extract_docx_text(doc_bytes)
+            if not doc_text.strip():
+                on_error("❌ 無法從文件提取文字。")
+                return
+
+            full_prompt = f"{_AI_FIX_PROMPT}\n\n=== 文件內容 ===\n{doc_text[:8000]}"
+
+            fix_btn.config(state="disabled", text="修正中…")
+            analyze_btn.config(state="disabled")
+            _streamed[0] = False
+            result_txt.delete("1.0", "end")
+            result_txt.insert("end", f"AI 分析拼字錯誤中… {_SPIN[0]}\n")
+            _spin_job[0] = result_txt.after(120, _spin_tick)
+
+            def on_fix_result(raw_text):
+                import json as _json
+                import re as _re
+                _stop_spinner()
+                result_txt.delete("1.0", "end")
+
+                json_match = _re.search(r'\{[\s\S]*\}', raw_text)
+                if not json_match:
+                    result_txt.insert("end", f"❌ AI 回應無法解析為 JSON：\n\n{raw_text}")
+                    fix_btn.config(state="normal", text="🔧 修正拼字")
+                    analyze_btn.config(state="normal")
+                    return
+
+                try:
+                    data = _json.loads(json_match.group())
+                    corrections = data.get("corrections", [])
+                    summary = data.get("summary", "")
+                except _json.JSONDecodeError as e:
+                    result_txt.insert("end", f"❌ JSON 解析失敗：{e}\n\n{raw_text}")
+                    fix_btn.config(state="normal", text="🔧 修正拼字")
+                    analyze_btn.config(state="normal")
+                    return
+
+                if not corrections:
+                    result_txt.insert("end", f"✅ AI 未發現需要修正的拼字錯誤。\n\n{summary}")
+                    fix_btn.config(state="normal", text="🔧 修正拼字")
+                    analyze_btn.config(state="normal")
+                    return
+
+                lines = [f"發現 {len(corrections)} 項修正：\n"]
+                for i, c in enumerate(corrections, 1):
+                    lines.append(f"{i}. 「{c.get('original', '')}」→「{c.get('corrected', '')}」")
+                    if c.get("reason"):
+                        lines.append(f"   {c['reason']}")
+                lines.append("")
+                result_txt.insert("end", "\n".join(lines))
+                result_txt.update_idletasks()
+
+                try:
+                    corrected_bytes, applied, not_found = _apply_text_corrections(doc_bytes, corrections)
+                except Exception as e:
+                    result_txt.insert("end", f"\n❌ 套用修正失敗：{e}")
+                    fix_btn.config(state="normal", text="🔧 修正拼字")
+                    analyze_btn.config(state="normal")
+                    return
+
+                orig_path = Path(self._last_docx_path)
+                out_path = orig_path.with_stem(orig_path.stem + "_corrected")
+                try:
+                    out_path.write_bytes(corrected_bytes)
+                    status_line = f"✅ 已套用 {applied}/{len(corrections)} 項修正\n儲存至：{out_path}"
+                    if not_found:
+                        status_line += f"\n\n⚠️ 以下 {len(not_found)} 項未在文件中找到（可能是 AI 幻覺或上下文誤判）：\n"
+                        status_line += "\n".join(f"  · 「{x}」" for x in not_found)
+                    result_txt.insert("end", status_line)
+                    self._last_docx_path = str(out_path)
+                    self._status.set(f"修正版儲存至：{out_path.name}")
+                    self._show_save_result(
+                        "拼字修正完成",
+                        f"套用 {applied}/{len(corrections)} 項修正\n\n修正版已儲存至：\n{out_path}",
+                        str(out_path),
+                    )
+                except Exception as e:
+                    result_txt.insert("end", f"\n❌ 儲存失敗：{e}")
+
+                fix_btn.config(state="normal", text="🔧 修正拼字")
+                analyze_btn.config(state="normal")
+                result_txt.see("end")
+
+            def on_fix_error(text):
+                _stop_spinner()
+                result_txt.delete("1.0", "end")
+                result_txt.insert("end", text)
+                fix_btn.config(state="normal", text="🔧 修正拼字")
+                analyze_btn.config(state="normal")
+
+            self._run_claude_async(full_prompt, on_fix_result, on_fix_error)
+
+        fix_btn = tk.Button(hdr, text="🔧 修正拼字", width=12, command=do_fix)
+        fix_btn.pack(side="left", padx=(6, 0))
 
     def _run_claude_async(self, full_prompt: str, on_result, on_error, on_chunk=None):
         """將 full_prompt 透過 claude -p 分析；callback 於 main thread 被呼叫。"""

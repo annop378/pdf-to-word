@@ -27,12 +27,12 @@ PDF 格式保留了原始排版的向量資訊（文字位置精確到 pt），�
 
 | 輸入格式 | 處理方式 |
 |----------|----------|
-| 文字型 PDF | `pdfplumber` 提取文字與座標位置 |
+| 文字型 PDF | `pdfplumber` 提取文字、座標與字型資訊 |
 | 掃描版 / 圖片型 PDF | `pytesseract` OCR 辨識文字 |
-| 帶邊框的表格 | `img2table` 視覺化表格偵測 |
-| 多欄 / 表單版面 | 依座標進行啟發式欄列分組 |
-| 嵌入圖片（如 Logo） | 提取後放置於對應儲存格 |
-| Word 檔（`.docx`） | 重新整理表格版面後輸出 |
+| 多欄 / 表單版面 | 依 PDF 座標進行啟發式欄列分組，還原原始間距 |
+| 嵌入圖片（如 Logo） | `PyMuPDF` 提取後按原始尺寸置入 |
+| AcroForm 表單欄位 | 對應 Word Legacy Forms（文字框、勾選框、下拉） |
+| Word 檔（`.docx`） | 透過 Word COM 轉 PDF 後重新版面輸出 |
 | 圖片（JPG / PNG 等） | OCR 辨識後輸出為 Word |
 
 ---
@@ -88,8 +88,8 @@ build_exe.bat
 ```
 
 打包完成後：
-- 獨立應用程式資料夾：`dist\PdfToWord\`
-- 可發佈的 ZIP 套件：`dist\PdfToWord.zip`
+- 獨立應用程式資料夾：`dist\PDFtoWord\`
+- 可發佈的 ZIP 套件：`dist\PDFtoWord.zip`
 
 > 打包使用 PyInstaller，設定檔為 `pdf2word.spec`。
 
@@ -118,7 +118,28 @@ pdf-to-word/
 每一頁輸出為一個無邊框 Word 表格，結構如下：
 
 - **列（rows）**：垂直座標相近的元素歸為同一列（容差 10 pt）
-- **欄（cells）**：同列內水平間距超過 40 pt 時切分為不同儲存格
-- **空白欄位**：水平線轉換為底線空白
-- **圖片**：從 PDF 提取後嵌入對應儲存格
-- **文字樣式**：保留粗體、斜體、字型大小
+- **欄（cells）**：同列內水平間距超過 55 pt 時切分為不同儲存格；冒號後方僅在接填寫欄位時才切分，避免正文被錯誤拆欄
+- **列高**：依 PDF 原始座標設定最小列高（`atLeast`），空白間距列使用精確高度（`exact`）
+- **儲存格邊距**：上下 0 pt，左右 1.4 pt（取代 Word 預設 5.4 pt），防止文字換行與版面膨脹
+- **空白欄位**：水平線轉換為 Word Legacy Forms 文字欄位或底線
+- **圖片**：從 PDF 提取後依原始尺寸嵌入（頁面寬度為上限）
+- **文字樣式**：保留粗體、斜體、字型大小、字型名稱
+- **AcroForm 欄位**：文字框 → FORMTEXT、勾選框 → FORMCHECKBOX、下拉選單 → FORMDROPDOWN
+
+---
+
+## 打包疑難排解
+
+若 `build_exe.bat` 出現目錄鎖定錯誤（PermissionError / WinError 32）：
+
+1. 執行 `restart_explorer.bat` 重啟 Windows 檔案總管以釋放鎖定
+2. 若仍無法解除，在**管理員 PowerShell** 執行：
+
+```powershell
+$target = ".\dist\PDFtoWord"
+Get-Process PDFtoWord,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
+Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+Start-Sleep 2
+Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+Start-Service WSearch -ErrorAction SilentlyContinue
+```

@@ -37,7 +37,7 @@ elif _SYSTEM_TESS.exists():
     pytesseract.pytesseract.tesseract_cmd = str(_SYSTEM_TESS)
 
 ROW_TOLERANCE    = 10   # 垂直中點容差（pt）
-COL_GAP          = 40
+COL_GAP          = 55
 MIN_BLANK_WIDTH  = 20
 BLANK_CHAR_WIDTH = 5.5
 
@@ -99,6 +99,16 @@ class SeparatorElem:
     """Full-width horizontal rule — acts as a merge barrier between rows."""
     top:    float
     bottom: float
+
+
+@dataclass
+class SpacerElem:
+    """Phantom element representing vertical white-space between parallel rows."""
+    height_pt: float
+    x0:        float = 0.0
+    top:       float = 0.0
+    x1:        float = 0.0
+    bottom:    float = 0.0
 
 
 # ── extraction ────────────────────────────────────────────────────────────────
@@ -427,7 +437,13 @@ def _split_cells(row_elems) -> list:
             if current:
                 prev = current[-1]
                 gap_split   = elem.x0 - prev.x1 > COL_GAP
-                colon_split = isinstance(prev, Word) and prev.text.rstrip().endswith(":")
+                # Only split after ":" when next element is a fill-in blank or form field,
+                # not when followed by plain text (avoids fragmenting body text like "Note: ...").
+                colon_split = (
+                    isinstance(prev, Word) and
+                    prev.text.rstrip().endswith(":") and
+                    isinstance(elem, (Blank, FormFieldElem, BoxElem))
+                )
                 if gap_split or colon_split:
                     cells.append(current)
                     current = []
@@ -504,11 +520,147 @@ def _zero_para_spacing(para):
     spacing.set(qn("w:lineRule"), "auto")
 
 
+def _reset_doc_spacing(doc: Document):
+    """重設 Normal 樣式段落間距，消除 python-docx 預設範本的 space_after 與 1.08 行距。"""
+    try:
+        style_elem = doc.styles['Normal'].element
+        pPr = style_elem.get_or_add_pPr()
+        for old in pPr.findall(qn("w:spacing")):
+            pPr.remove(old)
+        spacing = OxmlElement("w:spacing")
+        spacing.set(qn("w:before"),   "0")
+        spacing.set(qn("w:after"),    "0")
+        spacing.set(qn("w:line"),     "240")
+        spacing.set(qn("w:lineRule"), "auto")
+        pPr.append(spacing)
+    except Exception:
+        pass
+
+
 def _is_rule_image(elem: ImageElem) -> bool:
     """True when the image is a thin horizontal rule (not a real picture)."""
     height = elem.bottom - elem.top
     width  = elem.x1 - elem.x0
     return height < 12 and width > MIN_BLANK_WIDTH and width / max(height, 0.1) > 10
+
+
+def _compute_col_widths(row_cells_list: list, max_cols: int,
+                        content_x_min: float, content_x_max: float,
+                        usable_width_pt: float) -> tuple:
+    """
+    從各列元素的 x 座標計算欄寬。
+    以 max_cols 的列為樣本，取中位數邊界，轉換為 twips。
+    回傳 (widths_twips: list[int], boundaries_pdf: list[float])。
+    """
+    TWI = 20  # 1 pt = 20 twips
+    content_span = max(content_x_max - content_x_min, 1.0)
+
+    if max_cols <= 1:
+        w = round(usable_width_pt * TWI)
+        return ([max(w, 200)], [content_x_min, content_x_max])
+
+    col_x0_samples = [[] for _ in range(max_cols)]
+    last_x1_samples: list = []
+
+    for cells in row_cells_list:
+        if len(cells) != max_cols:
+            continue
+        for i, elems in enumerate(cells):
+            if not elems:
+                continue
+            x0 = min(e.x0 for e in elems)
+            x1 = max(e.x1 for e in elems)
+            col_x0_samples[i].append(x0)
+            if i == max_cols - 1:
+                last_x1_samples.append(x1)
+
+    def _med(lst):
+        if not lst:
+            return None
+        s = sorted(lst)
+        return s[len(s) // 2]
+
+    boundaries = [_med(s) for s in col_x0_samples]
+    boundaries.append(_med(last_x1_samples) or content_x_max)
+
+    # 線性插補缺失邊界
+    for i in range(len(boundaries)):
+        if boundaries[i] is not None:
+            continue
+        lo_i = next((j for j in range(i - 1, -1, -1) if boundaries[j] is not None), None)
+        hi_i = next((j for j in range(i + 1, len(boundaries)) if boundaries[j] is not None), None)
+        if lo_i is None and hi_i is None:
+            boundaries[i] = content_x_min + content_span * i / max_cols
+        elif lo_i is None:
+            boundaries[i] = boundaries[hi_i] - content_span * (hi_i - i) / max_cols
+        elif hi_i is None:
+            boundaries[i] = boundaries[lo_i] + content_span * (i - lo_i) / max_cols
+        else:
+            t = (i - lo_i) / (hi_i - lo_i)
+            boundaries[i] = boundaries[lo_i] + t * (boundaries[hi_i] - boundaries[lo_i])
+
+    raw = [max(boundaries[i + 1] - boundaries[i], 1.0) for i in range(max_cols)]
+    total = sum(raw)
+    widths_twips = [max(round(w / total * usable_width_pt * TWI), 200) for w in raw]
+    return (widths_twips, boundaries)
+
+
+def _set_cell_width(cell, width_twips: int):
+    """設定儲存格的明確寬度（twips）。"""
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:tcW")):
+        tcPr.remove(old)
+    tcW = OxmlElement("w:tcW")
+    tcW.set(qn("w:type"), "dxa")
+    tcW.set(qn("w:w"), str(max(width_twips, 1)))
+    tcPr.insert(0, tcW)
+
+
+def _set_cell_margins(cell, top_dxa: int = 0, bottom_dxa: int = 0,
+                      left_dxa: int = 28, right_dxa: int = 28):
+    """設定儲存格內部邊距（twips）。預設上下為 0，左右為 28 twips（≈1.4pt），
+    消除 Word 預設 5.4pt 邊距造成的文字換行與列高膨脹。"""
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:tcMar")):
+        tcPr.remove(old)
+    tcMar = OxmlElement("w:tcMar")
+    for side, val in (("top", top_dxa), ("left", left_dxa),
+                      ("bottom", bottom_dxa), ("right", right_dxa)):
+        m = OxmlElement(f"w:{side}")
+        m.set(qn("w:w"), str(val))
+        m.set(qn("w:type"), "dxa")
+        tcMar.append(m)
+    tcPr.append(tcMar)
+
+
+def _set_row_height(tbl_row, height_pt: float, exact: bool = False):
+    """設定列高（twips）。exact=True 用於 SpacerElem 列（精確高度），
+    否則用 atLeast（最小高度，可因內容增高）。"""
+    trPr = tbl_row._tr.get_or_add_trPr()
+    for old in trPr.findall(qn("w:trHeight")):
+        trPr.remove(old)
+    trH = OxmlElement("w:trHeight")
+    trH.set(qn("w:val"), str(max(1, round(height_pt * 20))))
+    trH.set(qn("w:hRule"), "exact" if exact else "atLeast")
+    trPr.append(trH)
+
+
+def _cell_col_range(cell_elems: list, col_boundaries: list, max_cols: int) -> tuple:
+    """依元素 x 範圍對應 (c_start, c_end) 欄索引。"""
+    if not cell_elems:
+        return (0, 0)
+    x0 = min(e.x0 for e in cell_elems)
+    x1 = max(e.x1 for e in cell_elems)
+
+    def _find_col(x):
+        for i in range(max_cols):
+            if x < col_boundaries[i + 1]:
+                return i
+        return max_cols - 1
+
+    c_start = _find_col(x0)
+    c_end   = _find_col(max(x0, x1 - 2))
+    return (c_start, max(c_start, min(c_end, max_cols - 1)))
 
 
 def _infer_alignment(elems, page_width: float):
@@ -771,7 +923,11 @@ def _write_cell(cell, elems, page_width: float = 0):
                     pass  # treat as blank — bottom border only
                 else:
                     width_pts = elem.x1 - elem.x0
-                    width_in  = max(0.3, min(width_pts / 72, 3.0))
+                    # Use exact PDF dimensions; cap only at page boundary, not an arbitrary 3".
+                    width_in = max(0.1, width_pts / 72)
+                    if page_width > 0:
+                        max_width_in = max(0.1, (page_width - 108) / 72)
+                        width_in = min(width_in, max_width_in)
                     buf = io.BytesIO(elem.data)
                     try:
                         run = para.add_run()
@@ -831,7 +987,10 @@ def _annotate_underlines(rows: list, splits: list = None) -> tuple:
         ):
             continue
         prev_idx = i - 1
-        while prev_idx >= 0 and all(isinstance(e, Blank) for e in rows[prev_idx]):
+        while prev_idx >= 0 and (
+            all(isinstance(e, Blank) for e in rows[prev_idx]) or
+            all(isinstance(e, SpacerElem) for e in rows[prev_idx])
+        ):
             prev_idx -= 1
         if prev_idx < 0:
             continue
@@ -992,7 +1151,12 @@ def _insert_parallel_spacers(rows: list, splits: list) -> tuple:
             parallel = _cells_parallel(prev_split, curr_split)
 
             if has_gap and parallel:
-                out_rows.append([])
+                spacer = SpacerElem(
+                    height_pt=gap,
+                    top=_row_bottom(prev_row),
+                    bottom=_row_top(curr_row),
+                )
+                out_rows.append([spacer])
                 out_splits.append([])
 
         out_rows.append(curr_row)
@@ -1029,57 +1193,125 @@ def _build_page_table(doc: Document, rows: list, page_width: float = 0,
     ]
     max_cols = max((len(c) for c in row_cells_list), default=1)
 
+    # ── 計算欄寬：從元素 x 座標取樣，轉換為絕對寬度 ────────────────────────
+    MARGIN_PT = 0.75 * 72  # 與 convert_pdf_to_word 的 section margin 一致
+    usable_width_pt = max((page_width or 595.0) - 2 * MARGIN_PT, 200.0)
+
+    all_elems_flat = [e for row in rows for e in row]
+    if all_elems_flat and page_width > 0:
+        content_x_min = min(e.x0 for e in all_elems_flat)
+        content_x_max = max(e.x1 for e in all_elems_flat)
+    else:
+        content_x_min, content_x_max = 0.0, page_width or 595.0
+
+    col_widths_twips, col_boundaries_pdf = _compute_col_widths(
+        row_cells_list, max_cols, content_x_min, content_x_max, usable_width_pt
+    )
+
     tbl = doc.add_table(rows=len(rows), cols=max_cols)
     _remove_all_borders(tbl)
 
     tblPr = tbl._tbl.tblPr
     tblW  = OxmlElement("w:tblW")
-    tblW.set(qn("w:type"), "pct")
-    tblW.set(qn("w:w"),    "5000")
+    tblW.set(qn("w:type"), "dxa")
+    tblW.set(qn("w:w"),    str(sum(col_widths_twips)))
     tblPr.append(tblW)
 
     tblLayout = OxmlElement("w:tblLayout")
-    tblLayout.set(qn("w:type"), "autofit")
+    tblLayout.set(qn("w:type"), "fixed")
     tblPr.append(tblLayout)
+
+    # 設定欄格線（tblGrid）：移除 add_table 產生的舊 tblGrid，再插入新的
+    for _old_grid in tbl._tbl.findall(qn("w:tblGrid")):
+        tbl._tbl.remove(_old_grid)
+    tblGrid = OxmlElement("w:tblGrid")
+    for w in col_widths_twips:
+        gridCol = OxmlElement("w:gridCol")
+        gridCol.set(qn("w:w"), str(w))
+        tblGrid.append(gridCol)
+    tbl._tbl.insert(tbl._tbl.index(tblPr) + 1, tblGrid)
 
     for r_idx, (row, cells) in enumerate(zip(rows, row_cells_list)):
         tbl_row = tbl.rows[r_idx]
+
+        # ── SpacerElem 列：精確空白高度，不寫入任何內容 ──────────────────────
+        if row and all(isinstance(e, SpacerElem) for e in row):
+            _set_row_height(tbl_row, row[0].height_pt, exact=True)
+            merged = tbl_row.cells[0]
+            for c in range(1, max_cols):
+                merged = merged.merge(tbl_row.cells[c])
+            _remove_cell_borders(merged)
+            _set_cell_margins(merged, top_dxa=0, bottom_dxa=0, left_dxa=0, right_dxa=0)
+            continue
+
         n = len(cells)
         if n == 0:
             continue
+
+        # ── 依 PDF 座標設定最小列高（atLeast，允許內容撐高）───────────────────
+        content_elems = [e for e in row if not isinstance(e, SpacerElem)]
+        if content_elems:
+            row_h = (max(e.bottom for e in content_elems) -
+                     min(e.top    for e in content_elems))
+            if row_h > 2:
+                _set_row_height(tbl_row, row_h, exact=False)
 
         if n == 1:
             merged = tbl_row.cells[0]
             for c in range(1, max_cols):
                 merged = merged.merge(tbl_row.cells[c])
+            _set_cell_width(merged, sum(col_widths_twips))
             has_blank = _write_cell(merged, cells[0], page_width)
             _remove_cell_borders(merged)
+            _set_cell_margins(merged)
             if has_blank or _cell_needs_border(r_idx, cells[0], bottom_border_set):
                 _set_cell_bottom_border(merged)
 
         elif n == max_cols:
             for c_idx, cell_elems in enumerate(cells):
                 cell = tbl_row.cells[c_idx]
+                _set_cell_width(cell, col_widths_twips[c_idx])
                 has_blank = _write_cell(cell, cell_elems, page_width)
                 _remove_cell_borders(cell)
+                _set_cell_margins(cell)
                 if has_blank or _cell_needs_border(r_idx, cell_elems, bottom_border_set):
                     _set_cell_bottom_border(cell)
 
         else:
-            cols_per = max_cols // n
-            rem      = max_cols % n
-            c_start  = 0
+            # 以 x 座標對應欄位範圍，取代均分法
+            c_used_up_to = 0
             for i, cell_elems in enumerate(cells):
-                span  = cols_per + (1 if i < rem else 0)
-                c_end = c_start + span - 1
+                c_start, c_end = _cell_col_range(cell_elems, col_boundaries_pdf, max_cols)
+                c_start = max(c_start, c_used_up_to)
+                if c_start >= max_cols:
+                    break  # 欄位已耗盡，跳過剩餘格
+                if i == n - 1:
+                    c_end = max_cols - 1
+                c_end = max(c_end, c_start)
+                c_end = min(c_end, max_cols - 1)  # 防止越界
                 merged = tbl_row.cells[c_start]
                 for c in range(c_start + 1, c_end + 1):
                     merged = merged.merge(tbl_row.cells[c])
+                span_w = sum(col_widths_twips[c_start:c_end + 1])
+                _set_cell_width(merged, span_w)
                 has_blank = _write_cell(merged, cell_elems, page_width)
                 _remove_cell_borders(merged)
+                _set_cell_margins(merged)
                 if has_blank or _cell_needs_border(r_idx, cell_elems, bottom_border_set):
                     _set_cell_bottom_border(merged)
-                c_start = c_end + 1
+                c_used_up_to = c_end + 1
+
+    # 補救掃描：確保空白格、spacer row 與未寫入格的段落也套用零行距
+    # （_write_cell 只處理有內容的格；Normal 樣式預設有 space_after=8pt）
+    _seen_tc: set = set()
+    for _tbl_row in tbl.rows:
+        for _cell in _tbl_row.cells:
+            _tc_id = id(_cell._tc)
+            if _tc_id in _seen_tc:
+                continue
+            _seen_tc.add(_tc_id)
+            for _para in _cell.paragraphs:
+                _zero_para_spacing(_para)
 
 
 # ── OCR fallback ──────────────────────────────────────────────────────────────
@@ -1093,6 +1325,7 @@ def _build_ocr_page(doc: Document, pdf_path: str, page_idx: int):
 # ── main entry ────────────────────────────────────────────────────────────────
 def convert_pdf_to_word(pdf_path: str) -> bytes:
     doc = Document()
+    _reset_doc_spacing(doc)
 
     for p in list(doc.paragraphs):
         p._element.getparent().remove(p._element)
@@ -1105,6 +1338,12 @@ def convert_pdf_to_word(pdf_path: str) -> bytes:
 
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
+        # 匹配 PDF 頁面尺寸（避免 Word 預設 Letter/A4 與原始 PDF 不符）
+        if pdf.pages:
+            fp = pdf.pages[0]
+            for section in doc.sections:
+                section.page_width  = Pt(fp.width)
+                section.page_height = Pt(fp.height)
         for page_idx, page in enumerate(pdf.pages):
             words, blanks, separators = _extract_text_and_blanks(page)
             images                    = _extract_images(pdf_path, page_idx)
@@ -1201,6 +1440,7 @@ def convert_image_to_word(image_path: str) -> bytes:
     page_width = img.width * scale
 
     doc = Document()
+    _reset_doc_spacing(doc)
     for p in list(doc.paragraphs):
         p._element.getparent().remove(p._element)
     for section in doc.sections:
