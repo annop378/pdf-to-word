@@ -69,8 +69,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "uvicorn", "fastapi", "starlette", "anyio",
-        "multipart", "httpx", "websockets",
+        "uvicorn", "fastapi", "starlette",
+        "multipart", "websockets",
+        # anthropic optional aiohttp transport — not used, skip to avoid needing aiohttp
+        "aiohttp",
+        "anthropic._vendor.httpx_aiohttp",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
