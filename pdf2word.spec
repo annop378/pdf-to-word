@@ -4,8 +4,12 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# 完整收集 anthropic（含所有子模組與資料檔）
-anthropic_datas, anthropic_binaries, anthropic_hiddenimports = collect_all("anthropic")
+# 完整收集 anthropic 及其依賴鏈
+anthropic_datas,  anthropic_binaries,  anthropic_hiddenimports  = collect_all("anthropic")
+anyio_datas,      anyio_binaries,      anyio_hiddenimports      = collect_all("anyio")
+httpx_datas,      httpx_binaries,      httpx_hiddenimports      = collect_all("httpx")
+httpcore_datas,   httpcore_binaries,   httpcore_hiddenimports   = collect_all("httpcore")
+sniffio_datas,    sniffio_binaries,    sniffio_hiddenimports    = collect_all("sniffio")
 
 TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")
 
@@ -25,10 +29,14 @@ for f in (TESSERACT_DIR / "tessdata").rglob("*"):
 a = Analysis(
     ["gui.py"],
     pathex=["."],
-    binaries=tess_binaries + anthropic_binaries,
+    binaries=tess_binaries + anthropic_binaries + anyio_binaries + httpx_binaries + httpcore_binaries + sniffio_binaries,
     datas=[
         *tessdata_files,
         *anthropic_datas,
+        *anyio_datas,
+        *httpx_datas,
+        *httpcore_datas,
+        *sniffio_datas,
     ],
     hiddenimports=[
         "pdfplumber",
@@ -41,8 +49,12 @@ a = Analysis(
         "win32com",
         "win32com.client",
         "pywintypes",
-        # AI vision (Claude SDK + AWS Bedrock SSO)
+        # AI vision (Claude SDK + AWS Bedrock SSO) and their deps
         *anthropic_hiddenimports,
+        *anyio_hiddenimports,
+        *httpx_hiddenimports,
+        *httpcore_hiddenimports,
+        *sniffio_hiddenimports,
         "boto3",
         "boto3.session",
         "botocore",
