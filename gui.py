@@ -12,8 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 
 def _ensure_ai_vision_deps():
     """
-    Ensure packages needed for AI vision (anthropic, boto3) are installed.
-    If missing, install them silently via pip.
+    Ensure packages needed for AI vision (anthropic, boto3) are available.
+    In a PyInstaller bundle they must be compiled in — pip install won't work.
+    In a normal Python environment, install silently if missing.
     Returns (ok: bool, missing: list[str]).
     """
     needed = []
@@ -28,6 +29,10 @@ def _ensure_ai_vision_deps():
 
     if not needed:
         return True, []
+
+    # PyInstaller bundle: cannot pip install at runtime
+    if getattr(sys, "frozen", False):
+        return False, needed
 
     try:
         subprocess.run(

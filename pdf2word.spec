@@ -1,7 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+# 完整收集 anthropic（含所有子模組與資料檔）
+anthropic_datas, anthropic_binaries, anthropic_hiddenimports = collect_all("anthropic")
 
 TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")
 
@@ -21,9 +25,10 @@ for f in (TESSERACT_DIR / "tessdata").rglob("*"):
 a = Analysis(
     ["gui.py"],
     pathex=["."],
-    binaries=tess_binaries,
+    binaries=tess_binaries + anthropic_binaries,
     datas=[
         *tessdata_files,
+        *anthropic_datas,
     ],
     hiddenimports=[
         "pdfplumber",
@@ -36,6 +41,17 @@ a = Analysis(
         "win32com",
         "win32com.client",
         "pywintypes",
+        # AI vision (Claude SDK + AWS Bedrock SSO)
+        *anthropic_hiddenimports,
+        "boto3",
+        "boto3.session",
+        "botocore",
+        "botocore.session",
+        "botocore.credentials",
+        "botocore.auth",
+        "botocore.awsrequest",
+        "botocore.endpoint",
+        "botocore.regions",
     ],
     hookspath=[],
     hooksconfig={},
