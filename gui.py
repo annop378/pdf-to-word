@@ -18,21 +18,35 @@ def _ensure_ai_vision_deps():
     Returns (ok: bool, missing: list[str]).
     """
     needed = []
+    _import_errors = {}
     try:
         import anthropic  # noqa
-    except ImportError:
+    except Exception as _e:  # catch all — frozen exe may raise OSError/AttributeError
         needed.append("anthropic>=1.0.0")
+        _import_errors["anthropic"] = f"{type(_e).__name__}: {_e}"
     try:
         import boto3  # noqa
-    except ImportError:
+    except Exception as _e:
         needed.append("boto3")
+        _import_errors["boto3"] = f"{type(_e).__name__}: {_e}"
 
     if not needed:
         return True, []
 
-    # PyInstaller bundle: cannot pip install at runtime
+    # PyInstaller bundle: cannot pip install at runtime.
+    # Write error to log file for diagnosis, then fall back silently.
     if getattr(sys, "frozen", False):
-        return False, needed
+        try:
+            _log_path = Path.home() / ".pdf2word" / "ai_vision_error.log"
+            _log_path.parent.mkdir(parents=True, exist_ok=True)
+            _log_path.write_text(
+                "\n".join(f"{k}: {v}" for k, v in _import_errors.items()),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        err_detail = "; ".join(f"{k}: {v}" for k, v in _import_errors.items())
+        return False, [f"{pkg} ({err_detail})" if err_detail else pkg for pkg in needed]
 
     try:
         subprocess.run(
@@ -532,84 +546,81 @@ class App(tk.Tk):
         self._ai_btn.config(state="normal")
 
     def _done(self, out_path: str):
-        self._restore_convert_btn()
-        if self._auto_fix_var.get():
+        if self._auto_fix_var.get() and not self._cancel_flag.is_set():
+            # Keep "取消" button active during auto-fix so user can cancel
             self._status.set("轉換完成，AI 修正拼字中…")
-            self._btn.config(state="disabled")
-            self._ai_btn.config(state="disabled")
             self._run_auto_fix_silent(out_path)
-        else:
-            self._status.set("Done! Saved to: " + out_path)
-            self._show_save_result(
-                "Conversion complete",
-                f"轉換完成，已儲存至：\n{out_path}",
-                out_path,
-            )
+            return
+        self._restore_convert_btn()
+        self._status.set("Done! Saved to: " + out_path)
+        self._show_save_result(
+            "Conversion complete",
+            f"轉換完成，已儲存至：\n{out_path}",
+            out_path,
+        )
 
     def _run_auto_fix_silent(self, base_path: str):
         """轉換後自動執行 AI 拼字修正（靜默模式，不開 popup）。"""
+        def _finish_autofix(status_msg: str = ""):
+            self._restore_convert_btn()
+            if status_msg:
+                self._status.set(status_msg)
+
         try:
             doc_bytes = Path(base_path).read_bytes()
         except Exception as e:
-            self._status.set(f"轉換完成，讀取失敗：{e}")
-            self._btn.config(state="normal")
-            self._ai_btn.config(state="normal")
+            _finish_autofix(f"轉換完成，讀取失敗：{e}")
             return
         doc_text = _extract_docx_text(doc_bytes)
         if not doc_text.strip():
-            self._status.set(f"轉換完成（無文字可修正）：{base_path}")
-            self._btn.config(state="normal")
-            self._ai_btn.config(state="normal")
+            _finish_autofix(f"轉換完成（無文字可修正）：{base_path}")
             return
+
+        # Check cancel before starting async
+        if self._cancel_flag.is_set():
+            _finish_autofix("已取消")
+            return
+
         full_prompt = f"{_AI_FIX_PROMPT}\n\n=== 文件內容 ===\n{doc_text[:8000]}"
 
         def on_fix_done(raw_text):
+            if self._cancel_flag.is_set():
+                _finish_autofix("已取消")
+                return
             import json as _json, re as _re
             json_match = _re.search(r'\{[\s\S]*\}', raw_text)
             if not json_match:
-                self._status.set(f"轉換完成（AI 修正回應無效）：{base_path}")
-                self._btn.config(state="normal")
-                self._ai_btn.config(state="normal")
+                _finish_autofix(f"轉換完成（AI 修正回應無效）：{base_path}")
                 return
             try:
                 corrections = _json.loads(json_match.group()).get("corrections", [])
             except Exception:
-                self._status.set(f"轉換完成（AI 修正 JSON 解析失敗）：{base_path}")
-                self._btn.config(state="normal")
-                self._ai_btn.config(state="normal")
+                _finish_autofix(f"轉換完成（AI 修正 JSON 解析失敗）：{base_path}")
                 return
             if not corrections:
-                self._status.set(f"轉換完成（AI 未發現拼字錯誤）：{base_path}")
-                self._btn.config(state="normal")
-                self._ai_btn.config(state="normal")
+                _finish_autofix(f"轉換完成（AI 未發現拼字錯誤）：{base_path}")
                 return
             try:
                 corrected_bytes, applied, _ = _apply_text_corrections(doc_bytes, corrections)
             except Exception as e:
-                self._status.set(f"轉換完成（修正套用失敗：{e}）：{base_path}")
-                self._btn.config(state="normal")
-                self._ai_btn.config(state="normal")
+                _finish_autofix(f"轉換完成（修正套用失敗：{e}）：{base_path}")
                 return
             orig_path = Path(base_path)
             out_path = orig_path.with_stem(orig_path.stem + "_corrected")
             try:
                 out_path.write_bytes(corrected_bytes)
                 self._last_docx_path = str(out_path)
-                self._status.set(f"完成！已修正 {applied}/{len(corrections)} 項 → {out_path.name}")
+                _finish_autofix(f"完成！已修正 {applied}/{len(corrections)} 項 → {out_path.name}")
                 self._show_save_result(
                     "轉換並修正完成",
                     f"原始檔：{orig_path.name}\n修正版：{out_path.name}\n\n套用 {applied}/{len(corrections)} 項拼字修正",
                     str(out_path),
                 )
             except Exception as e:
-                self._status.set(f"修正版儲存失敗：{e}")
-            self._btn.config(state="normal")
-            self._ai_btn.config(state="normal")
+                _finish_autofix(f"修正版儲存失敗：{e}")
 
         def on_fix_error(text):
-            self._status.set(f"轉換完成（AI 修正失敗）：{base_path}")
-            self._btn.config(state="normal")
-            self._ai_btn.config(state="normal")
+            _finish_autofix(f"轉換完成（AI 修正失敗）：{base_path}")
 
         self._run_claude_async(full_prompt, on_fix_done, on_fix_error)
 
