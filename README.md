@@ -15,7 +15,8 @@
 | 格式 | 效果 | 原因 |
 |------|------|------|
 | **PDF（文字型）** | ⭐⭐⭐ 最佳 | PDF 內嵌精確的字元座標、字型、字級資訊，可直接提取版面結構；欄位對齊、縮排、表格偵測準確率最高 |
-| PDF（掃描版） | ⭐⭐ 良好 | 經 OCR 辨識，準確度取決於掃描品質；清晰掃描件效果接近文字型 PDF |
+| PDF（掃描版）+ API Key | ⭐⭐⭐ 最佳 | Claude Vision API 分析整頁圖片，回傳表格結構、背景色、邊框，忠實還原版面 |
+| PDF（掃描版）無 API Key | ⭐⭐ 良好 | 經 Tesseract OCR 辨識，準確度取決於掃描品質；清晰掃描件效果接近文字型 PDF |
 | 圖片（JPG / PNG） | ⭐⭐ 良好 | 同樣走 OCR，但圖片解析度與對比度直接影響辨識率 |
 | Word（.docx） | ⭐ 有限 | 僅重新整理表格版面，不做完整版面重建；複雜樣式可能流失 |
 
@@ -28,7 +29,8 @@ PDF 格式保留了原始排版的向量資訊（文字位置精確到 pt），�
 | 輸入格式 | 處理方式 |
 |----------|----------|
 | 文字型 PDF | `pdfplumber` 提取文字、座標與字型資訊 |
-| 掃描版 / 圖片型 PDF | `pytesseract` OCR 辨識文字 |
+| 掃描版 PDF（有 API Key） | Claude Vision API 分析圖片，回傳 JSON 結構重建表格（含背景色、邊框） |
+| 掃描版 PDF（無 API Key）| `pytesseract` OCR 辨識文字，依 bounding box 重建表格 |
 | 多欄 / 表單版面 | 依 PDF 座標進行啟發式欄列分組，還原原始間距 |
 | 嵌入圖片（如 Logo） | `PyMuPDF` 提取後按原始尺寸置入 |
 | AcroForm 表單欄位 | 對應 Word Legacy Forms（文字框、勾選框、下拉） |
@@ -42,6 +44,9 @@ PDF 格式保留了原始排版的向量資訊（文字位置精確到 pt），�
 - Python 3.10+
 - [Tesseract OCR 5.x](https://github.com/UB-Mannheim/tesseract/wiki)（安裝於 `C:\Program Files\Tesseract-OCR\tesseract.exe`）
   - 打包成 EXE 時，Tesseract 會一併內嵌，無需另外安裝
+- （選用）Claude Vision — 用於掃描版 PDF，可還原背景色、格線與表格結構；支援兩種認證方式：
+  - **AWS Bedrock SSO**：已登入公司 SSO 後自動使用，無需額外設定（公司環境推薦）
+  - **Anthropic API Key**：設定 `ANTHROPIC_API_KEY` 環境變數（個人帳號）
 
 ---
 
@@ -76,6 +81,27 @@ python gui.py
 ```
 
 點選「Select File」選擇檔案，按「Convert」即可在原始路徑旁產生同名的 `.docx`。
+
+#### 啟用 Claude Vision（掃描版 PDF 最佳化）
+
+1. 點選介面右上角 **⚙ AI 設定**
+2. 在「掃描版 PDF 轉換 Model」下拉選擇 model（預設 `claude-sonnet-5`）
+3. 儲存後，轉換掃描版 PDF 時自動使用 Claude Vision，忠實還原背景色、邊框、checkbox 狀態與表格結構
+
+**認證方式（優先序）：**
+1. `ANTHROPIC_API_KEY` 環境變數（個人 Anthropic 帳號）
+2. AWS Bedrock SSO（公司環境，已登入 `aws sso login` 後自動生效，無需額外設定）
+
+**初次在新電腦執行**：程式會自動安裝所需套件（`anthropic`、`boto3`）。
+
+> 留空則自動降級為 Tesseract OCR，功能不受影響。
+
+#### Web API 啟用方式
+
+```bash
+set AI_VISION_MODEL=claude-sonnet-5
+python launcher.py
+```
 
 ---
 
@@ -125,6 +151,7 @@ pdf-to-word/
 - **圖片**：從 PDF 提取後依原始尺寸嵌入（頁面寬度為上限）
 - **文字樣式**：保留粗體、斜體、字型大小、字型名稱
 - **AcroForm 欄位**：文字框 → FORMTEXT、勾選框 → FORMCHECKBOX、下拉選單 → FORMDROPDOWN
+- **掃描版 PDF（Claude Vision）**：整頁圖片存為暫存 PNG，優先透過 Anthropic Python SDK（Bedrock SSO 或 API Key）呼叫 Claude，取得含背景色（`w:shd`）、四側邊框、checkbox 狀態、列高、colspan 的 JSON，直接重建 Word 表格；SDK 失敗時降級 CLI，最終降級 OCR
 
 ---
 

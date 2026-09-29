@@ -9,11 +9,42 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+
+def _ensure_ai_vision_deps():
+    """
+    Ensure packages needed for AI vision (anthropic, boto3) are installed.
+    If missing, install them silently via pip.
+    Returns (ok: bool, missing: list[str]).
+    """
+    needed = []
+    try:
+        import anthropic  # noqa
+    except ImportError:
+        needed.append("anthropic>=1.0.0")
+    try:
+        import boto3  # noqa
+    except ImportError:
+        needed.append("boto3")
+
+    if not needed:
+        return True, []
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + needed,
+            check=True, capture_output=True,
+        )
+        return True, needed
+    except Exception:
+        return False, needed
+
 from converter import (
     IMAGE_EXTS,
     convert_image_to_word,
     convert_pdf_to_word,
     convert_word_to_word,
+    is_scanned_pdf,
+    make_searchable_pdf,
 )
 
 FILETYPES = [
@@ -202,10 +233,11 @@ def _label_for(path: Path) -> str:
     return "Unknown format"
 
 
-def _convert(path: str) -> bytes:
+def _convert(path: str, ai_vision_model: str = "") -> bytes:
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
-        return convert_pdf_to_word(path)
+        return convert_pdf_to_word(path,
+                                   ai_vision_model=ai_vision_model or None)
     if ext == ".docx":
         return convert_word_to_word(path)
     if ext in IMAGE_EXTS:
@@ -218,8 +250,10 @@ class App(tk.Tk):
         super().__init__()
         self.title("Document to Word Converter")
         self.resizable(False, False)
-        self._ai_model_var   = tk.StringVar(value="claude-haiku-4-5-20251001")
-        self._auto_fix_var   = tk.BooleanVar(value=False)
+        self._ai_model_var        = tk.StringVar(value="claude-haiku-4-5-20251001")
+        self._ai_vision_model_var = tk.StringVar(value="claude-sonnet-5")
+        self._auto_fix_var        = tk.BooleanVar(value=False)
+        self._cancel_flag         = threading.Event()
         self._last_docx_path = None
         self._load_ai_config()
         self._build()
@@ -286,23 +320,166 @@ class App(tk.Tk):
         src = self._path_var.get()
         if not src:
             return
-        self._btn.config(state="disabled")
+        self._cancel_flag.clear()
+        self._btn.config(text="取消", command=self._cancel, state="normal")
         self._ai_btn.config(state="disabled")
         self._status.set("Converting, please wait…")
         self.update_idletasks()
         threading.Thread(target=self._run, args=(src,), daemon=True).start()
 
+    def _cancel(self):
+        self._cancel_flag.set()
+        self._status.set("取消中…")
+        self._btn.config(state="disabled")
+
     def _run(self, src: str):
         try:
-            docx_bytes = _convert(src)
-            out_path = Path(src).with_suffix(".docx")
-            if out_path == Path(src):
-                out_path = Path(src).with_stem(Path(src).stem + "_table")
+            src_path = Path(src)
+
+            # ── 掃描版 PDF：顯示警告後自動嘗試建 OCR 文字層 ────────────────────
+            if src_path.suffix.lower() == ".pdf" and is_scanned_pdf(src):
+                choice_evt  = threading.Event()
+                user_choice = ["cancel"]  # "proceed" | "cancel"
+
+                def _show_warning():
+                    self._show_scanned_warning(
+                        src,
+                        on_choice=lambda c: (
+                            user_choice.__setitem__(0, c),
+                            choice_evt.set(),
+                        ),
+                    )
+
+                self.after(0, _show_warning)
+                choice_evt.wait()
+
+                if user_choice[0] == "cancel" or self._cancel_flag.is_set():
+                    self.after(0, lambda: (self._restore_convert_btn(), self._status.set("已取消")))
+                    return
+
+                # 使用者確認後，嘗試建立 OCR 文字層（專為掃描 PDF 設計，應該成功）
+                self.after(0, lambda: self._status.set("OCR 辨識中，建立可搜尋文字層…"))
+                searchable_path = src_path.with_name(src_path.stem + "_searchable.pdf")
+                try:
+                    make_searchable_pdf(src, str(searchable_path))
+                    actual_src = str(searchable_path)
+                    self.after(0, lambda: self._status.set("OCR 完成，開始轉換…"))
+                except Exception as ocr_exc:
+                    # OCR 失敗（罕見）→ 靜默降級，直接用原始 PDF
+                    actual_src = src
+            else:
+                actual_src = src
+
+            if self._cancel_flag.is_set():
+                self.after(0, lambda: (self._restore_convert_btn(), self._status.set("已取消")))
+                return
+
+            # 啟用 AI vision 時，確保相依套件已安裝
+            _vision_model = self._ai_vision_model_var.get().strip()
+            if _vision_model:
+                self.after(0, lambda: self._status.set("檢查 AI 套件…"))
+                _ok, _missing = _ensure_ai_vision_deps()
+                if not _ok:
+                    _msg = f"AI vision 所需套件安裝失敗：{', '.join(_missing)}\n將改用 OCR 模式轉換。"
+                    self.after(0, lambda m=_msg: messagebox.showwarning("套件安裝失敗", m))
+                    _vision_model = ""
+                elif _missing:
+                    self.after(0, lambda: self._status.set("已安裝缺少的套件，開始轉換…"))
+
+            self.after(0, lambda: self._status.set("轉換中…"))
+            docx_bytes = _convert(actual_src,
+                                   ai_vision_model=_vision_model)
+            out_path = src_path.with_suffix(".docx")
+            if out_path == src_path:
+                out_path = src_path.with_stem(src_path.stem + "_table")
             out_path.write_bytes(docx_bytes)
             self._last_docx_path = str(out_path)
             self.after(0, self._done, str(out_path))
         except Exception as exc:
             self.after(0, self._error, str(exc))
+
+    def _show_scanned_warning(self, pdf_path: str, on_choice):
+        """
+        偵測到掃描版 PDF 時告知使用者品質限制並確認是否繼續。
+        確認後程式會自動嘗試建立 OCR 文字層（ocrmypdf）再轉換，
+        OCR 失敗時自動降級直接轉換。
+        on_choice("proceed") → 繼續
+        on_choice("cancel")  → 取消
+        """
+        has_ai = bool(self._ai_vision_model_var.get().strip())
+
+        if has_ai:
+            quality_note = (
+                "Claude Vision 將分析版面，\n"
+                "可還原背景色、表格結構與粗體文字。\n"
+                "Logo / 印章圖片仍可能與原始版面略有差異。"
+            )
+        else:
+            quality_note = (
+                "轉換結果可能與原始版面差異較大：\n"
+                "  • 字型、粗體、斜體 — 無法自動識別\n"
+                "  • 印章 / Logo 圖片 — 不會嵌入\n"
+                "  • 表格欄寬、對齊   — 僅為估算\n\n"
+                "建議在「⚙ AI 設定」選擇 claude-sonnet-5\n"
+                "以獲得接近原始版面的輸出品質。"
+            )
+
+        msg = (
+            "此 PDF 是圖片掃描格式（非文字版）。\n\n"
+            + quality_note +
+            "\n\n程式將先用 OCR 建立文字層再轉換。\n"
+            "是否繼續？"
+        )
+
+        proceed = messagebox.askyesno(
+            "偵測到掃描版 PDF", msg, icon="warning"
+        )
+        on_choice("proceed" if proceed else "cancel")
+
+    def _show_searchable_verify(self, searchable_path: str, on_confirm):
+        """顯示驗證對話框：讓使用者開啟 searchable PDF 確認 OCR 文字後決定是否繼續。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("驗證 OCR 文字")
+        dlg.resizable(True, False)
+        dlg.minsize(400, 200)
+        dlg.geometry("460x240")
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+
+        tk.Label(
+            dlg,
+            text=("已建立含 OCR 文字層的 PDF：\n"
+                  f"{Path(searchable_path).name}\n\n"
+                  "請開啟確認文字辨識正確後，\n"
+                  "再選擇是否繼續轉換為 Word。"),
+            wraplength=380, justify="left", padx=16, pady=12,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        def _open():
+            try:
+                os.startfile(searchable_path)
+            except Exception:
+                pass
+
+        ttk.Button(dlg, text="開啟 PDF 驗證", command=_open, width=16).grid(
+            row=1, column=0, columnspan=2, padx=16, pady=(0, 8))
+
+        btn_f = tk.Frame(dlg)
+        btn_f.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 12), sticky="e")
+
+        def _confirm():
+            dlg.destroy()
+            on_confirm(True)
+
+        def _cancel():
+            dlg.destroy()
+            on_confirm(False)
+
+        ttk.Button(btn_f, text="繼續轉 Word", command=_confirm, width=12).pack(
+            side="right", padx=(4, 0))
+        ttk.Button(btn_f, text="取消", command=_cancel, width=8).pack(side="right")
+
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
 
     def _show_save_result(self, title: str, message: str, out_path: str):
         """顯示儲存結果對話框，並自動開啟資料夾（Explorer 選取該檔案）。"""
@@ -343,9 +520,14 @@ class App(tk.Tk):
         if self._auto_fix_var.get():
             self._open_ai_settings()
 
-    def _done(self, out_path: str):
-        self._btn.config(state="normal")
+    def _restore_convert_btn(self):
+        """轉換結束（完成/錯誤/取消）後恢復 Convert 按鈕。"""
+        self._cancel_flag.clear()
+        self._btn.config(text="Convert", command=self._start, state="normal")
         self._ai_btn.config(state="normal")
+
+    def _done(self, out_path: str):
+        self._restore_convert_btn()
         if self._auto_fix_var.get():
             self._status.set("轉換完成，AI 修正拼字中…")
             self._btn.config(state="disabled")
@@ -427,8 +609,8 @@ class App(tk.Tk):
         self._run_claude_async(full_prompt, on_fix_done, on_fix_error)
 
     def _error(self, msg: str):
+        self._restore_convert_btn()
         self._status.set("Error: " + msg)
-        self._btn.config(state="normal")
         messagebox.showerror("Conversion failed", msg)
 
     # ── AI 設定 ────────────────────────────────────────────────────────────────
@@ -438,12 +620,16 @@ class App(tk.Tk):
             try:
                 cfg = json.loads(_AI_CONFIG_PATH.read_text(encoding="utf-8"))
                 self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-4-5-20251001"))
+                self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
             except Exception:
                 pass
 
     def _save_ai_config(self):
         _CONF_DIR.mkdir(parents=True, exist_ok=True)
-        cfg = {"claude_model": self._ai_model_var.get().strip()}
+        cfg = {
+            "claude_model":        self._ai_model_var.get().strip(),
+            "claude_vision_model": self._ai_vision_model_var.get().strip(),
+        }
         _AI_CONFIG_PATH.write_text(
             json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -496,13 +682,35 @@ class App(tk.Tk):
             row=0, column=2, padx=(4, 0))
 
         ttk.Label(dlg, text="留空 = 使用 Claude CLI 預設 model",
-                  foreground="gray").grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+                  foreground="gray").grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
+
+        ttk.Separator(dlg, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        ttk.Label(dlg, text="掃描版 PDF 轉換 Model（建議 claude-sonnet-5）：").grid(
+            row=4, column=0, sticky="w", padx=10, pady=(0, 2))
+
+        vision_f = ttk.Frame(dlg)
+        vision_f.grid(row=5, column=0, padx=10, pady=(0, 2), sticky="ew")
+        vision_f.columnconfigure(0, weight=1)
+
+        _vision_var = tk.StringVar(value=self._ai_vision_model_var.get())
+        vision_cb = ttk.Combobox(vision_f, textvariable=_vision_var,
+                                 values=_PRESET_MODELS, width=48)
+        vision_cb.grid(row=0, column=0, sticky="ew")
+
+        ttk.Label(dlg,
+                  text="用於掃描版 PDF 的視覺分析（還原粗體、對齊、背景色、表格結構）。\n"
+                       "建議使用 Sonnet — 多模態能力較 Haiku 強，版面還原準確率更高。\n"
+                       "留空則改用本機 OCR（Tesseract）。",
+                  foreground="gray").grid(row=6, column=0, sticky="w", padx=10, pady=(0, 10))
 
         btn_f = ttk.Frame(dlg)
-        btn_f.grid(row=3, column=0, padx=10, pady=(4, 12), sticky="e")
+        btn_f.grid(row=7, column=0, padx=10, pady=(4, 12), sticky="e")
 
         def save_close():
             self._ai_model_var.set(_model_var.get().strip())
+            self._ai_vision_model_var.set(_vision_var.get().strip())
             self._save_ai_config()
             dlg.destroy()
 

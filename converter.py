@@ -199,6 +199,17 @@ def _extract_form_fields(pdf_path: str, page_idx: int) -> list:
     return fields
 
 
+def _has_table_structure(page) -> bool:
+    """True if the page has significant rectangular cell borders (a bordered form)."""
+    count = 0
+    for rect in page.rects:
+        w = abs(rect.get("x1", 0) - rect.get("x0", 0))
+        h = abs(rect.get("y1", 0) - rect.get("y0", 0))
+        if w > 40 and h > 8:
+            count += 1
+    return count >= 4
+
+
 def _extract_text_and_blanks(page) -> tuple:
     """Extract Words and Blanks from a pdfplumber page."""
     ph = page.height
@@ -486,6 +497,22 @@ def _remove_cell_borders(cell):
         b.set(qn("w:sz"),    "0")
         b.set(qn("w:space"), "0")
         b.set(qn("w:color"), "auto")
+        tcBorders.append(b)
+    tcPr.append(tcBorders)
+
+
+def _set_all_cell_borders(cell, color: str = "808080"):
+    """Apply thin single-line borders on all 4 sides (for bordered-form pages)."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:tcBorders")):
+        tcPr.remove(old)
+    tcBorders = OxmlElement("w:tcBorders")
+    for side in ("top", "left", "bottom", "right"):
+        b = OxmlElement(f"w:{side}")
+        b.set(qn("w:val"),   "single")
+        b.set(qn("w:sz"),    "4")
+        b.set(qn("w:space"), "0")
+        b.set(qn("w:color"), color)
         tcBorders.append(b)
     tcPr.append(tcBorders)
 
@@ -1167,7 +1194,12 @@ def _insert_parallel_spacers(rows: list, splits: list) -> tuple:
 
 # ── page builder ─────────────────────────────────────────────────────────────
 def _build_page_table(doc: Document, rows: list, page_width: float = 0,
-                      separators: list = None):
+                      separators: list = None, max_cols_cap: int = 0,
+                      show_borders: bool = False):
+    """
+    max_cols_cap: when > 0, caps the number of table columns to this value.
+    Use for OCR-derived rows to prevent extreme column fragmentation on forms.
+    """
     if not rows:
         return
 
@@ -1192,6 +1224,8 @@ def _build_page_table(doc: Document, rows: list, page_width: float = 0,
         for i, s in enumerate(row_cells_list)
     ]
     max_cols = max((len(c) for c in row_cells_list), default=1)
+    if max_cols_cap > 0:
+        max_cols = min(max_cols, max_cols_cap)
 
     # ── 計算欄寬：從元素 x 座標取樣，轉換為絕對寬度 ────────────────────────
     MARGIN_PT = 0.75 * 72  # 與 convert_pdf_to_word 的 section margin 一致
@@ -1256,26 +1290,30 @@ def _build_page_table(doc: Document, rows: list, page_width: float = 0,
             if row_h > 2:
                 _set_row_height(tbl_row, row_h, exact=False)
 
+        def _apply_borders(c, has_b, elems):
+            if show_borders:
+                _set_all_cell_borders(c)
+            else:
+                _remove_cell_borders(c)
+            if has_b or _cell_needs_border(r_idx, elems, bottom_border_set):
+                _set_cell_bottom_border(c)
+
         if n == 1:
             merged = tbl_row.cells[0]
             for c in range(1, max_cols):
                 merged = merged.merge(tbl_row.cells[c])
             _set_cell_width(merged, sum(col_widths_twips))
             has_blank = _write_cell(merged, cells[0], page_width)
-            _remove_cell_borders(merged)
+            _apply_borders(merged, has_blank, cells[0])
             _set_cell_margins(merged)
-            if has_blank or _cell_needs_border(r_idx, cells[0], bottom_border_set):
-                _set_cell_bottom_border(merged)
 
         elif n == max_cols:
             for c_idx, cell_elems in enumerate(cells):
                 cell = tbl_row.cells[c_idx]
                 _set_cell_width(cell, col_widths_twips[c_idx])
                 has_blank = _write_cell(cell, cell_elems, page_width)
-                _remove_cell_borders(cell)
+                _apply_borders(cell, has_blank, cell_elems)
                 _set_cell_margins(cell)
-                if has_blank or _cell_needs_border(r_idx, cell_elems, bottom_border_set):
-                    _set_cell_bottom_border(cell)
 
         else:
             # 以 x 座標對應欄位範圍，取代均分法
@@ -1295,10 +1333,8 @@ def _build_page_table(doc: Document, rows: list, page_width: float = 0,
                 span_w = sum(col_widths_twips[c_start:c_end + 1])
                 _set_cell_width(merged, span_w)
                 has_blank = _write_cell(merged, cell_elems, page_width)
-                _remove_cell_borders(merged)
+                _apply_borders(merged, has_blank, cell_elems)
                 _set_cell_margins(merged)
-                if has_blank or _cell_needs_border(r_idx, cell_elems, bottom_border_set):
-                    _set_cell_bottom_border(merged)
                 c_used_up_to = c_end + 1
 
     # 補救掃描：確保空白格、spacer row 與未寫入格的段落也套用零行距
@@ -1322,8 +1358,903 @@ def _build_ocr_page(doc: Document, pdf_path: str, page_idx: int):
         doc.add_paragraph(line.strip())
 
 
+def make_searchable_pdf(pdf_path: str, output_path: str = None) -> bytes:
+    """
+    Add an OCR text layer to a scanned PDF using ocrmypdf + Tesseract.
+    The original image is preserved; text becomes selectable/searchable.
+    Returns the searchable PDF as bytes.
+    If output_path is given, also writes the file to disk.
+    Raises RuntimeError if ocrmypdf is not available.
+
+    Windows note: ocrmypdf uses multiprocessing which requires the
+    'spawn' start method. We set it here to avoid fork-related crashes
+    when called from a GUI thread.
+    """
+    try:
+        import ocrmypdf as _ocrmypdf
+    except ImportError:
+        raise RuntimeError(
+            "ocrmypdf is not installed. Run: pip install ocrmypdf"
+        )
+
+    import io as _io
+    import multiprocessing as _mp
+
+    # On Windows (and frozen executables), multiprocessing defaults to
+    # 'spawn'. Force it explicitly to prevent 'fork' errors from GUI threads.
+    try:
+        _mp.set_start_method("spawn", force=False)
+    except RuntimeError:
+        pass  # already set
+
+    # Write to a temp file first (more reliable than BytesIO on Windows)
+    if output_path:
+        _ocrmypdf.ocr(
+            pdf_path,
+            output_path,
+            language="eng",
+            skip_text=True,
+            progress_bar=False,
+        )
+        return Path(output_path).read_bytes()
+    else:
+        import tempfile as _tempfile
+        tmp_fd, tmp_path = _tempfile.mkstemp(suffix=".pdf")
+        os.close(tmp_fd)
+        try:
+            _ocrmypdf.ocr(
+                pdf_path,
+                tmp_path,
+                language="eng",
+                skip_text=True,
+                progress_bar=False,
+            )
+            data = Path(tmp_path).read_bytes()
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+        return data
+
+
+def is_scanned_pdf(pdf_path: str) -> bool:
+    """Return True if the first page has no selectable text (likely scanned)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            return False
+        return len(pdf.pages[0].extract_words()) == 0
+
+
+# ── img2table table-structure detection ──────────────────────────────────────
+def _ensure_tesseract_path():
+    """Add the system Tesseract directory to PATH if not already present."""
+    tess_dir = r"C:\Program Files\Tesseract-OCR"
+    if os.path.isdir(tess_dir) and tess_dir.lower() not in os.environ.get("PATH", "").lower():
+        os.environ["PATH"] = tess_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+def _build_img2table_page(doc: Document, pdf_path: str, page_idx: int,
+                           page_width: float, page_height: float) -> bool:
+    """
+    Detect table structure from a scanned PDF page using img2table (visual line
+    detection), then build Word tables with proper column widths and colspan.
+
+    Returns True when at least one table was detected and rendered.
+    Returns False so the caller can fall back to line-level OCR.
+    """
+    _ensure_tesseract_path()
+
+    try:
+        from img2table.document import PDF as _I2TPDF
+        from img2table.ocr import TesseractOCR as _TesseractOCR
+    except ImportError:
+        return False
+
+    try:
+        _ocr = _TesseractOCR(lang="eng")
+        _pdf = _I2TPDF(src=pdf_path, pages=[page_idx])
+        raw_tables = _pdf.extract_tables(
+            ocr=_ocr,
+            implicit_rows=True,
+            borderless_tables=False,
+        )
+    except Exception:
+        return False
+
+    page_tables = raw_tables.get(page_idx, [])
+    if not page_tables:
+        return False
+
+    TWI = 20
+    MARGIN_PT = 0.75 * 72
+    usable_pt = max(page_width - 2 * MARGIN_PT, 200.0)
+
+    for tbl_data in page_tables:
+        content = tbl_data.content  # OrderedDict: row_idx → [TableCell, ...]
+        if not content:
+            continue
+
+        # ── 建立欄邊界（所有格的 x1 聯集，排序後為欄起始座標） ──────────────
+        all_x1 = sorted({int(c.bbox.x1) for row in content.values() for c in row})
+        max_x2  = max(int(c.bbox.x2) for row in content.values() for c in row)
+        num_cols = len(all_x1)
+        if num_cols == 0:
+            continue
+
+        # 欄寬（pixel）→ 比例 → twips
+        col_ends_px = all_x1[1:] + [max_x2]
+        col_widths_px = [col_ends_px[i] - all_x1[i] for i in range(num_cols)]
+        total_px = sum(col_widths_px) or 1
+        col_widths_twips = [
+            max(round(w / total_px * usable_pt * TWI), 200)
+            for w in col_widths_px
+        ]
+
+        # ── 去重每列中重複的合併格，計算 colspan ─────────────────────────────
+        def _col_idx(x):
+            """Return the column index whose left boundary equals x (tolerance 5px)."""
+            for i, v in enumerate(all_x1):
+                if abs(v - x) <= 5:
+                    return i
+            return 0
+
+        def _colspan(x1, x2):
+            """Number of logical columns spanned by a cell with given pixel x-range."""
+            c_start = _col_idx(int(x1))
+            # c_end = largest col index whose start is still inside this cell
+            c_end = c_start
+            for i in range(c_start + 1, num_cols):
+                if all_x1[i] < int(x2) - 5:
+                    c_end = i
+                else:
+                    break
+            return max(1, c_end - c_start + 1)
+
+        # img2table renders PDFs at ~200 DPI internally
+        IMG2TABLE_DPI = 200
+        PX_TO_PT = 72.0 / IMG2TABLE_DPI  # 0.36
+
+        # ── 去重每列中重複的合併格（相同 x1 → 同一合併格），計算 colspan ──────
+        # 同時收集每列的 row_height_px 供字級估算
+        deduped_rows = []
+        for row_cells in content.values():
+            seen_x1: set = set()
+            unique_cells = []
+            y1s = [int(c.bbox.y1) for c in row_cells]
+            y2s = [int(c.bbox.y2) for c in row_cells]
+            row_h_px = max(y2s) - min(y1s) if y2s and y1s else 20
+            for cell in row_cells:
+                key = int(cell.bbox.x1)
+                if key not in seen_x1:
+                    seen_x1.add(key)
+                    span = _colspan(cell.bbox.x1, cell.bbox.x2)
+                    unique_cells.append((cell, span, row_h_px))
+            deduped_rows.append(unique_cells)
+
+        # ── 格層級去重：跨列合併產生的重複格，在後續列中以空格取代 ──────────
+        # img2table 不支援 rowspan，相同格內容會重複出現在多列。
+        # 策略：追蹤前一列「原始」簽名（包含已被壓制的），後續列相同配對 → 清空。
+        # 使用原始 row_items 簽名（壓制前），確保跨 3+ 列的 rowspan 也能正確去重。
+        prev_row_all_sigs: set = set()
+        normalized_rows: list = []
+        for row_items in deduped_rows:
+            new_row = []
+            # 先收集本列所有原始簽名（不論是否被壓制）
+            curr_all_sigs = {
+                ((cell.value or "").strip(), int(cell.bbox.x1))
+                for cell, _s, _h in row_items
+                if (cell.value or "").strip()
+            }
+            for cell, span, row_h_px in row_items:
+                sig = ((cell.value or "").strip(), int(cell.bbox.x1))
+                if sig[0] and sig in prev_row_all_sigs:
+                    # 前一列已出現此格 → 清空（模擬 rowspan）
+                    class _EmptyCell:
+                        def __init__(self, orig):
+                            self.bbox  = orig.bbox
+                            self.value = ""
+                    new_row.append((_EmptyCell(cell), span, row_h_px))
+                else:
+                    new_row.append((cell, span, row_h_px))
+            normalized_rows.append(new_row)
+            prev_row_all_sigs = curr_all_sigs
+        deduped_rows = normalized_rows
+
+        if not deduped_rows:
+            continue
+
+        # ── 建 Word 表格 ─────────────────────────────────────────────────────
+        tbl = doc.add_table(rows=len(deduped_rows), cols=num_cols)
+        _remove_all_borders(tbl)
+
+        tblPr = tbl._tbl.tblPr
+        tblW = OxmlElement("w:tblW")
+        tblW.set(qn("w:type"), "dxa")
+        tblW.set(qn("w:w"), str(sum(col_widths_twips)))
+        tblPr.append(tblW)
+        tblLayout = OxmlElement("w:tblLayout")
+        tblLayout.set(qn("w:type"), "fixed")
+        tblPr.append(tblLayout)
+
+        for _old in tbl._tbl.findall(qn("w:tblGrid")):
+            tbl._tbl.remove(_old)
+        tblGrid = OxmlElement("w:tblGrid")
+        for w in col_widths_twips:
+            gc = OxmlElement("w:gridCol")
+            gc.set(qn("w:w"), str(w))
+            tblGrid.append(gc)
+        tbl._tbl.insert(tbl._tbl.index(tblPr) + 1, tblGrid)
+
+        table_span_twips = sum(col_widths_twips)
+        all_written_tc: set = set()  # for zero-spacing sweep only
+
+        for r_idx, row_items in enumerate(deduped_rows):
+            tbl_row = tbl.rows[r_idx]
+            col_cursor = 0
+            # Per-row seen_tc: prevents double-writing within a row (due to
+            # python-docx returning the same merged _tc for multiple col indices),
+            # but does NOT persist across rows (cross-row _tc sharing after
+            # horizontal merges would otherwise cause rows to be silently skipped).
+            row_seen_tc: set = set()
+
+            for cell, span, row_h_px in row_items:
+                if col_cursor >= num_cols:
+                    break
+                col_end = min(col_cursor + span - 1, num_cols - 1)
+
+                word_cell = tbl_row.cells[col_cursor]
+                # Use the actual _tc element object (not id()) to avoid false
+                # positives from Python memory address reuse after GC.
+                if word_cell._tc in row_seen_tc:
+                    col_cursor = col_end + 1
+                    continue
+
+                for c in range(col_cursor + 1, col_end + 1):
+                    word_cell = word_cell.merge(tbl_row.cells[c])
+                row_seen_tc.add(word_cell._tc)
+                all_written_tc.add(id(word_cell._tc))
+
+                span_w = sum(col_widths_twips[col_cursor:col_end + 1])
+                _set_cell_width(word_cell, span_w)
+                _set_cell_margins(word_cell)
+                _set_all_cell_borders(word_cell)
+
+                # ── 字級：依列高估算，clamp 8-14pt ──────────────────────────
+                # 標準 PDF 表單列高約 14-20pt，對應字級約 8-10pt；
+                # 標題列高約 30-50pt，對應字級約 11-13pt。
+                row_h_pt = row_h_px * PX_TO_PT
+                font_pt  = max(8.0, min(round(row_h_pt * 0.40), 14))
+
+                # ── 對齊：全寬格置中，否則靠左 ─────────────────────────────
+                is_full_width = (span_w >= table_span_twips * 0.85)
+                alignment = WD_ALIGN_PARAGRAPH.CENTER if is_full_width else WD_ALIGN_PARAGRAPH.LEFT
+
+                # ── 文字清洗：過濾 OCR 雜訊 ─────────────────────────────────
+                # 1. 去除 "None"（img2table 無法辨識時填入的字串）
+                # 2. 過濾獨立行中僅 1-2 個字元的雜訊（如 "G"、短亂碼），
+                #    但保留已知有意義的縮寫（MA、PD、F、M 等）
+                # 已知有意義的短字（不過濾）
+                _KEEP_SHORT = {
+                    "MA", "PD", "F", "M", "W", "B", "A", "X",
+                    "Y", "N", "AT", "OR", "OF", "TO", "IN", "BY",
+                    "NO", "1", "2", "3", "HAZ", "DOB", "DOU", "PO",
+                    "PAGE", "DATE", "HAIR", "RACE", "EYES", "MALE",
+                    "FLED", "FLED", "NONE", "TYPE", "ONLY",
+                }
+
+                def _clean_lines(raw: str) -> list:
+                    import re as _re
+                    result = []
+                    for ln in (raw or "").split("\n"):
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        # 去除行內 standalone "None"（img2table 無值時填入）
+                        # 只移除被空格或行首/行尾包圍的 None，避免誤刪正常單字
+                        ln = _re.sub(r'(?<!\w)None(?!\w)', '', ln).strip()
+                        if not ln:
+                            continue
+                        upper = ln.upper()
+                        # 全大寫字母且 ≤ 4 字元：若不在保留清單則視為 OCR 尾段殘字
+                        if (len(ln) <= 4 and upper.replace(" ", "").isalpha() and
+                                upper not in _KEEP_SHORT):
+                            continue
+                        # 移除行尾跟著空格+單一大寫字母的 OCR 雜訊（如 "Department G"）
+                        ln = _re.sub(r'\s+[A-Z]$', '', ln).strip()
+                        if not ln:
+                            continue
+                        result.append(ln)
+                    return result or [""]
+
+                lines = _clean_lines(cell.value or "")
+
+                for li, line in enumerate(lines):
+                    para = word_cell.paragraphs[0] if li == 0 else word_cell.add_paragraph()
+                    _zero_para_spacing(para)
+                    para.alignment = alignment
+                    if line:
+                        run = para.add_run(line)
+                        run.font.size = Pt(font_pt)
+
+                col_cursor = col_end + 1
+
+        # zero spacing for untouched cells (best-effort)
+        seen_for_spacing: set = set()
+        for tbl_row in tbl.rows:
+            for word_cell in tbl_row.cells:
+                tc_id = id(word_cell._tc)
+                if tc_id not in seen_for_spacing:
+                    seen_for_spacing.add(tc_id)
+                    if tc_id not in all_written_tc:
+                        for para in word_cell.paragraphs:
+                            _zero_para_spacing(para)
+
+    return True
+
+
+def _is_fullpage_image(images: list, page_width: float, page_height: float) -> bool:
+    """True when the only image on the page covers (nearly) the entire page — i.e. a scanned PDF."""
+    if len(images) != 1:
+        return False
+    img = images[0]
+    return (img.x0 < 10 and img.top < 10 and
+            img.x1 > page_width - 10 and img.bottom > page_height - 10)
+
+
+def _build_ocr_page_table(doc: Document, pdf_path: str, page_idx: int,
+                           page_width: float, page_height: float, dpi: int = 200):
+    """
+    Rebuild a scanned PDF page as a positioned Word table.
+
+    Priority:
+    1. img2table visual table detection (detects grid lines → proper colspan)
+    2. Line-level Tesseract OCR fallback (block/par/line groupby, max 6 cols)
+    3. Plain-text OCR paragraph fallback
+    """
+    # ── 優先用 img2table 偵測表格格線結構 ──────────────────────────────────
+    if _build_img2table_page(doc, pdf_path, page_idx, page_width, page_height):
+        return
+
+    # ── 降級：行級 OCR 聚合 ──────────────────────────────────────────────
+    _ensure_tesseract_path()
+    pil_img = _page_to_pil(pdf_path, page_idx, dpi=dpi)
+    scale = 72.0 / dpi  # pixel → pt
+
+    # psm 11 = sparse text (best for forms with multiple independent regions)
+    data = pytesseract.image_to_data(
+        pil_img, lang="eng", config="--psm 11",
+        output_type=pytesseract.Output.DATAFRAME,
+    )
+    data = data[(data["conf"] > 0) & (data["text"].str.strip() != "")]
+
+    if data.empty:
+        _build_ocr_page(doc, pdf_path, page_idx)
+        return
+
+    # Aggregate words → lines using Tesseract's own block/par/line hierarchy.
+    line_words: list = []
+    for _, grp in data.groupby(["block_num", "par_num", "line_num"], sort=True):
+        x0     = grp["left"].min() * scale
+        top    = grp["top"].min() * scale
+        x1     = (grp["left"] + grp["width"]).max() * scale
+        bottom = (grp["top"]  + grp["height"]).max() * scale
+        text   = " ".join(grp["text"].astype(str).str.strip()).strip()
+        if text:
+            line_words.append(Word(text=text, x0=x0, top=top, x1=x1, bottom=bottom))
+
+    if not line_words:
+        _build_ocr_page(doc, pdf_path, page_idx)
+        return
+
+    rows = _group_rows(line_words, [], [], page_width=page_width)
+    _build_page_table(doc, rows, page_width=page_width, max_cols_cap=6)
+
+
+# ── AI vision fallback (via claude CLI) ──────────────────────────────────────
+_AI_LAYOUT_PROMPT = """\
+@{image_path}
+
+You are reconstructing a scanned court/legal form as a Word document using tables.
+Your output drives the Word table builder directly — layout quality depends on you.
+
+Return ONLY valid JSON. No markdown fences, no explanation.
+
+─── SCHEMA ───────────────────────────────────────────────────────────────────
+{
+  "sections": [
+    {
+      "num_cols": <integer 1-8: number of LOGICAL columns in this section>,
+      "col_widths_pct": [<pct>, ...],  // optional: relative width of each column, must sum to 100
+      "rows": [
+        {
+          "height_pt": <row height in points; full letter page = 792pt>,
+          "cells": [
+            {
+              "text": "<cell text; use actual newline char for multi-line content>",
+              "bold": <true|false>,
+              "italic": <true|false>,
+              "font_size": <pt, typically 8-12>,
+              "colspan": <1 to num_cols>,
+              "align": "<left|center|right>",
+              "bg_color": "<#RRGGBB if non-white fill, else null>",
+              "border_top":    <true|false>,
+              "border_bottom": <true|false>,
+              "border_left":   <true|false>,
+              "border_right":  <true|false>,
+              "is_blank": <true if this is an empty fill-in field>,
+              "is_image": <true if this cell contains a logo/seal/stamp/graphic (not just text)>,
+              "image_region": {
+                "x_pct": <left edge as % of page width, 0-100>,
+                "y_pct": <top edge as % of page height, 0-100>,
+                "w_pct": <width as % of page width>,
+                "h_pct": <height as % of page height>
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+─── SECTION RULES ────────────────────────────────────────────────────────────
+Split the page into 3-10 LOGICAL SECTIONS (e.g. header, court info, party info,
+charges, checkboxes, signature). Each section gets its OWN num_cols.
+Different sections may have different num_cols.
+Target 4-15 rows per section.
+
+─── ROW RULES ────────────────────────────────────────────────────────────────
+One ROW = one horizontal band of the form, NOT one line of OCR text.
+Form fields on the same horizontal level → SAME row.
+A row with "Name: ___ DOB: ___" is ONE row with 4 cells: [Name:][blank][DOB:][blank]
+
+─── CELL RULES ───────────────────────────────────────────────────────────────
+Merge all text that logically belongs together into ONE cell (use \n for line breaks).
+A form label + its fill-in blank = 2 adjacent cells in the same row.
+Empty fill-in fields: text="", is_blank=true, border_bottom=true.
+Checkboxes: text="[ ] Option label" or "[x] Option label".
+Do NOT create separate rows for each checkbox option — group them in one cell.
+Max 8 columns in any section.
+
+─── IMAGE / LOGO RULES ──────────────────────────────────────────────────────
+If a cell contains a logo, seal, stamp, emblem, or graphic image (not just text):
+  - Set is_image=true
+  - Set image_region with the approximate bounding box as % of page dimensions
+  - text can still contain any caption/label text visible near the image
+  - The image_region is used to crop and embed the actual image from the scan.
+
+─── WIDTH / HEIGHT RULES ─────────────────────────────────────────────────────
+col_widths_pct: set when columns are clearly unequal (e.g. [20,80] for label+value).
+height_pt: estimate from the row's visible proportion of the 792pt page.
+Tall header rows: 30-50pt. Normal form rows: 15-25pt. Compact rows: 10-14pt.
+
+─── BACKGROUND & BORDERS ─────────────────────────────────────────────────────
+bg_color: ONLY set when there is clearly visible non-white shading.
+Borders: set true only when a visible line exists on that side.
+"""
+
+
+def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
+    """
+    Call Claude directly via the Anthropic Python SDK with a base64-encoded image.
+    Supports both direct API key (ANTHROPIC_API_KEY) and AWS Bedrock SSO.
+    Bedrock is used when ANTHROPIC_API_KEY is absent but AWS credentials are available.
+    Returns response text, or raises RuntimeError on failure.
+    """
+    import base64 as _b64
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        raise RuntimeError("anthropic package not installed")
+
+    _prompt_text = _AI_LAYOUT_PROMPT.replace("{image_path}", "").strip()
+    _prompt_lines = _prompt_text.splitlines()
+    _prompt_clean = "\n".join(l for l in _prompt_lines if not l.strip().startswith("@"))
+
+    with open(image_path, "rb") as _f:
+        _img_b64 = _b64.b64encode(_f.read()).decode("utf-8")
+
+    _messages = [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": _img_b64,
+                },
+            },
+            {"type": "text", "text": _prompt_clean},
+        ],
+    }]
+
+    # ── 優先使用 ANTHROPIC_API_KEY；否則嘗試 AWS Bedrock SSO ─────────────────
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        _model = model or "claude-sonnet-5"
+        _client = _anthropic.Anthropic()
+        _resp = _client.messages.create(
+            model=_model, max_tokens=8192, messages=_messages)
+        return _resp.content[0].text
+
+    # AWS Bedrock：model id 格式不同，需轉換
+    _bedrock_model_map = {
+        "claude-sonnet-5":           "us.anthropic.claude-sonnet-5",
+        "claude-sonnet-4-6":         "us.anthropic.claude-sonnet-4-6",
+        "claude-opus-5-5":           "us.anthropic.claude-opus-5-5",
+        "claude-opus-5":             "us.anthropic.claude-opus-5",
+        "claude-haiku-4-5-20251001": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "claude-fable-5-1":          "us.anthropic.claude-fable-5-1",
+        "claude-fable-5":            "us.anthropic.claude-fable-5",
+    }
+    _raw_model = model or "claude-sonnet-5"
+    _bedrock_id = _bedrock_model_map.get(_raw_model, _raw_model)
+
+    try:
+        _client = _anthropic.AnthropicBedrock()
+        # Use streaming to support larger responses (Bedrock requires streaming
+        # for max_tokens > ~21000). Collect the full text via stream context.
+        _text_parts = []
+        with _client.messages.stream(
+            model=_bedrock_id,
+            max_tokens=32000,
+            messages=_messages,
+        ) as _stream:
+            for _event in _stream.text_stream:
+                _text_parts.append(_event)
+        _full_text = "".join(_text_parts)
+        if not _full_text:
+            raise RuntimeError("Empty streaming response from Bedrock")
+        return _full_text
+    except RuntimeError:
+        raise
+    except Exception as _e:
+        raise RuntimeError(f"Bedrock call failed: {_e}") from _e
+
+
+def _call_claude_cli_with_image(image_path: str, model: str = "") -> str:
+    """
+    Call claude -p CLI with an image attachment using @path syntax in the prompt.
+    Same auth mechanism as the existing text-correction flow in gui.py.
+    Returns response text, or raises RuntimeError on failure.
+    """
+    import subprocess
+    import shutil
+    import tempfile as _tempfile
+
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        for npm_bin in [
+            str(Path(os.path.expanduser("~")) / "AppData" / "Roaming" / "npm"),
+            str(Path(os.path.expanduser("~")) / "AppData" / "Local"   / "npm"),
+        ]:
+            if npm_bin.lower() not in env.get("PATH", "").lower():
+                env["PATH"] = npm_bin + os.pathsep + env.get("PATH", "")
+
+    claude_exe = shutil.which("claude", path=env.get("PATH", ""))
+    if not claude_exe:
+        raise RuntimeError("claude CLI not found")
+
+    prompt = _AI_LAYOUT_PROMPT.replace("{image_path}", image_path.replace("\\", "/"))
+
+    tf = _tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".txt", delete=False)
+    try:
+        tf.write(prompt)
+        tf.close()
+        tmp_path = tf.name
+
+        if sys.platform == "win32":
+            model_flag = f' --model "{model}"' if model else ""
+            cmd = f'chcp 65001 > nul && type "{tmp_path}" | claude -p{model_flag}'
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, env=env, timeout=180)
+        else:
+            args = [claude_exe, "-p"]
+            if model:
+                args += ["--model", model]
+            with open(tmp_path, encoding="utf-8") as f_in:
+                result = subprocess.run(
+                    args, stdin=f_in, capture_output=True, env=env, timeout=180)
+
+        if result.returncode != 0:
+            err = result.stderr.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"claude CLI exited {result.returncode}: {err}")
+
+        return result.stdout.decode("utf-8", errors="replace").strip()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _set_cell_shading(cell, hex_color: str):
+    """Set cell background fill color (w:shd). hex_color e.g. 'FFD700' (no #)."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:shd")):
+        tcPr.remove(old)
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"),   "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"),  hex_color.lstrip("#").upper())
+    tcPr.append(shd)
+
+
+def _set_cell_borders_ai(cell, top: bool, bottom: bool, left: bool, right: bool):
+    """Set individual cell borders based on AI-detected border flags."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tcPr.append(borders)
+    for side, enabled in (("top", top), ("bottom", bottom),
+                           ("left", left), ("right", right)):
+        for old in borders.findall(qn(f"w:{side}")):
+            borders.remove(old)
+        b = OxmlElement(f"w:{side}")
+        if enabled:
+            b.set(qn("w:val"),   "single")
+            b.set(qn("w:sz"),    "6")
+            b.set(qn("w:space"), "0")
+            b.set(qn("w:color"), "000000")
+        else:
+            b.set(qn("w:val"),   "none")
+            b.set(qn("w:sz"),    "0")
+            b.set(qn("w:space"), "0")
+            b.set(qn("w:color"), "auto")
+        borders.append(b)
+
+
+def _build_ai_section_table(doc: Document, section: dict,
+                              col_widths_twips: list, usable_pt: float,
+                              pil_img=None, page_width_pt: float = 0,
+                              page_height_pt: float = 0):
+    """
+    Build one Word table for a single AI-returned section dict.
+    col_widths_twips: list of twips widths for each column in this section.
+    pil_img: optional PIL image of the full page (for cropping logo/seal regions).
+    """
+    TWI = 20
+    num_cols = len(col_widths_twips)
+    rows = section.get("rows", [])
+    if not rows:
+        return
+
+    tbl = doc.add_table(rows=len(rows), cols=num_cols)
+    _remove_all_borders(tbl)
+
+    tblPr = tbl._tbl.tblPr
+    total_w = sum(col_widths_twips)
+    tblW = OxmlElement("w:tblW")
+    tblW.set(qn("w:type"), "dxa")
+    tblW.set(qn("w:w"),    str(total_w))
+    tblPr.append(tblW)
+    tblLayout = OxmlElement("w:tblLayout")
+    tblLayout.set(qn("w:type"), "fixed")
+    tblPr.append(tblLayout)
+
+    for _old in tbl._tbl.findall(qn("w:tblGrid")):
+        tbl._tbl.remove(_old)
+    tblGrid = OxmlElement("w:tblGrid")
+    for w in col_widths_twips:
+        gc = OxmlElement("w:gridCol")
+        gc.set(qn("w:w"), str(w))
+        tblGrid.append(gc)
+    tbl._tbl.insert(tbl._tbl.index(tblPr) + 1, tblGrid)
+
+    all_written_tc: set = set()  # for zero-spacing sweep only
+
+    for r_idx, ai_row in enumerate(rows):
+        tbl_row = tbl.rows[r_idx]
+        h_pt = float(ai_row.get("height_pt", 15))
+        if h_pt > 2:
+            _set_row_height(tbl_row, h_pt, exact=False)
+
+        cells_def = ai_row.get("cells", [])
+        col_cursor = 0
+        # Per-row seen_tc — same fix as _build_img2table_page:
+        # cross-row _tc sharing after horizontal merges must not gate later rows.
+        row_seen_tc: set = set()
+
+        for cell_def in cells_def:
+            if col_cursor >= num_cols:
+                break
+            colspan = max(1, int(cell_def.get("colspan", 1)))
+            col_end  = min(col_cursor + colspan - 1, num_cols - 1)
+
+            word_cell = tbl_row.cells[col_cursor]
+            if word_cell._tc in row_seen_tc:
+                col_cursor = col_end + 1
+                continue
+
+            for c in range(col_cursor + 1, col_end + 1):
+                word_cell = word_cell.merge(tbl_row.cells[c])
+            row_seen_tc.add(word_cell._tc)
+            all_written_tc.add(id(word_cell._tc))
+
+            span_w = sum(col_widths_twips[col_cursor:col_end + 1])
+            _set_cell_width(word_cell, span_w)
+            _set_cell_margins(word_cell)
+
+            _set_cell_borders_ai(
+                word_cell,
+                top    = bool(cell_def.get("border_top",    False)),
+                bottom = bool(cell_def.get("border_bottom", False)),
+                left   = bool(cell_def.get("border_left",   False)),
+                right  = bool(cell_def.get("border_right",  False)),
+            )
+
+            bg = cell_def.get("bg_color")
+            if bg:
+                _set_cell_shading(word_cell, bg)
+
+            # ── Image / Logo region ──────────────────────────────────────
+            is_image = bool(cell_def.get("is_image", False))
+            img_region = cell_def.get("image_region")
+            if is_image and pil_img is not None and img_region and page_width_pt > 0:
+                try:
+                    iw, ih = pil_img.size
+                    x_pct = float(img_region.get("x_pct", 0)) / 100
+                    y_pct = float(img_region.get("y_pct", 0)) / 100
+                    w_pct = float(img_region.get("w_pct", 10)) / 100
+                    h_pct = float(img_region.get("h_pct", 10)) / 100
+                    # clamp to image bounds
+                    cx0 = max(0, int(x_pct * iw))
+                    cy0 = max(0, int(y_pct * ih))
+                    cx1 = min(iw, int((x_pct + w_pct) * iw))
+                    cy1 = min(ih, int((y_pct + h_pct) * ih))
+                    if cx1 > cx0 and cy1 > cy0:
+                        cropped = pil_img.crop((cx0, cy0, cx1, cy1))
+                        buf = io.BytesIO()
+                        cropped.save(buf, format="PNG")
+                        buf.seek(0)
+                        para = word_cell.paragraphs[0]
+                        _zero_para_spacing(para)
+                        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        # scale to fit cell width
+                        img_w_pt = (cx1 - cx0) * (72.0 / 200)  # assuming 200 DPI render
+                        cell_w_pt = span_w / TWI
+                        final_w = min(img_w_pt, cell_w_pt * 0.9)
+                        para.add_run().add_picture(buf, width=Pt(max(final_w, 36)))
+                except Exception:
+                    pass  # image crop failed, fall through to text
+
+            # ── Text ─────────────────────────────────────────────────────
+            text      = str(cell_def.get("text", ""))
+            is_blank  = bool(cell_def.get("is_blank", False))
+            bold      = bool(cell_def.get("bold",   False))
+            italic    = bool(cell_def.get("italic", False))
+            fs        = max(7, min(float(cell_def.get("font_size", 10)), 28))
+            align_str = cell_def.get("align", "left").lower()
+            alignment = {
+                "center": WD_ALIGN_PARAGRAPH.CENTER,
+                "right":  WD_ALIGN_PARAGRAPH.RIGHT,
+            }.get(align_str, WD_ALIGN_PARAGRAPH.LEFT)
+
+            lines = text.split("\n") if text.strip() else [""]
+            for line_idx, line in enumerate(lines):
+                # if we already added an image, add text as separate paragraph
+                start_idx = 1 if (is_image and img_region) else 0
+                if line_idx == 0 and not (is_image and img_region):
+                    para = word_cell.paragraphs[0]
+                else:
+                    para = word_cell.add_paragraph()
+                _zero_para_spacing(para)
+                para.alignment = alignment
+                line = line.strip()
+                if is_blank and not line:
+                    _insert_formtext_field(para, span_w / TWI)
+                elif line:
+                    run = para.add_run(line)
+                    run.bold      = bold
+                    run.italic    = italic
+                    run.font.size = Pt(fs)
+
+            col_cursor = col_end + 1
+
+    # Zero spacing for untouched cells
+    seen_for_spacing: set = set()
+    for tbl_row in tbl.rows:
+        for word_cell in tbl_row.cells:
+            tc_id = id(word_cell._tc)
+            if tc_id not in seen_for_spacing:
+                seen_for_spacing.add(tc_id)
+                if tc_id not in all_written_tc:
+                    for para in word_cell.paragraphs:
+                        _zero_para_spacing(para)
+
+
+def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
+                          page_height: float, model: str, pil_img=None):
+    """
+    Send the page image to Claude via CLI, receive sections-based JSON,
+    then build one Word table per section.
+    Returns True on success, False on failure (caller falls back to OCR).
+    """
+    import json as _json
+
+    # Try SDK first (avoids Claude Code permission interception), fall back to CLI.
+    raw = None
+    for _caller in (_call_claude_sdk_with_image, _call_claude_cli_with_image):
+        try:
+            raw = _caller(image_path, model=model)
+            if raw and len(raw) > 20:
+                break
+        except Exception:
+            continue
+    if not raw:
+        return False
+
+    # Extract JSON from response (handles markdown fences, leading text, thinking preambles)
+    import re as _re
+    stripped = raw.strip()
+    # Strip markdown code fences if present
+    if stripped.startswith("```"):
+        stripped = stripped.split("```")[1]
+        if stripped.startswith("json"):
+            stripped = stripped[4:]
+        stripped = stripped.strip()
+    # If still not starting with { or [, find the first JSON object/array
+    if not stripped.startswith(("{", "[")):
+        _m = _re.search(r'[{\[]', stripped)
+        if _m:
+            stripped = stripped[_m.start():]
+        else:
+            return False
+    # Trim trailing content after the closing brace/bracket
+    try:
+        layout = _json.loads(stripped)
+    except Exception:
+        try:
+            _end = max(stripped.rfind("}"), stripped.rfind("]"))
+            if _end > 0:
+                layout = _json.loads(stripped[:_end + 1])
+            else:
+                return False
+        except Exception:
+            return False
+
+    # Support both new sections format and legacy flat rows format
+    sections = layout.get("sections")
+    if not sections:
+        flat_rows = layout.get("rows", [])
+        if not flat_rows:
+            return False
+        num_cols = max(
+            (sum(c.get("colspan", 1) for c in r.get("cells", [])) for r in flat_rows),
+            default=1,
+        )
+        sections = [{"num_cols": num_cols, "rows": flat_rows}]
+
+    if not sections:
+        return False
+
+    TWI = 20
+    MARGIN_PT = 0.75 * 72
+    usable_pt = max(page_width - 2 * MARGIN_PT, 200.0)
+
+    for section in sections:
+        num_cols = max(1, int(section.get("num_cols", 1)))
+
+        # col_widths_pct: optional proportional column widths
+        pct_raw = section.get("col_widths_pct") or []
+        if len(pct_raw) == num_cols and sum(pct_raw) > 0:
+            total_pct = sum(pct_raw)
+            col_widths = [
+                max(round(p / total_pct * usable_pt * TWI), 200)
+                for p in pct_raw
+            ]
+        else:
+            col_w = max(round(usable_pt / num_cols * TWI), 200)
+            col_widths = [col_w] * num_cols
+
+        _build_ai_section_table(doc, section, col_widths, usable_pt,
+                                pil_img=pil_img,
+                                page_width_pt=page_width,
+                                page_height_pt=page_height)
+
+    return True
+
+
 # ── main entry ────────────────────────────────────────────────────────────────
-def convert_pdf_to_word(pdf_path: str) -> bytes:
+def convert_pdf_to_word(pdf_path: str, *,
+                        ai_vision_model: str = None) -> bytes:
     doc = Document()
     _reset_doc_spacing(doc)
 
@@ -1366,14 +2297,39 @@ def convert_pdf_to_word(pdf_path: str) -> bytes:
                 blanks = [b for b in blanks if not _inside_any_ff(b)]
                 images = [i for i in images if not _inside_any_ff(i)]
 
-            if not words and not images and not form_fields:
+            page_has_borders = _has_table_structure(page)
+
+            if not words and not form_fields and _is_fullpage_image(images, page.width, page.height):
+                # 掃描 PDF：整頁是一張圖
+                # 有指定 AI model 時，先存成暫存 PNG 再交給 claude CLI 分析
+                used_ai = False
+                if ai_vision_model:
+                    pil_img = _page_to_pil(pdf_path, page_idx, dpi=200)
+                    tmp_img_fd, tmp_img_path = tempfile.mkstemp(suffix=".png")
+                    os.close(tmp_img_fd)
+                    try:
+                        pil_img.save(tmp_img_path, format="PNG")
+                        used_ai = _build_ai_page_table(
+                            doc, tmp_img_path,
+                            page_width=page.width, page_height=page.height,
+                            model=ai_vision_model,
+                            pil_img=pil_img,
+                        )
+                    finally:
+                        Path(tmp_img_path).unlink(missing_ok=True)
+                if not used_ai:
+                    _build_ocr_page_table(doc, pdf_path, page_idx,
+                                          page_width=page.width,
+                                          page_height=page.height)
+            elif not words and not images and not form_fields:
                 _build_ocr_page(doc, pdf_path, page_idx)
             else:
                 rows = _group_rows(words, blanks, images,
                                    page_width=page.width,
                                    form_fields=form_fields)
                 _build_page_table(doc, rows, page_width=page.width,
-                                  separators=separators)
+                                  separators=separators,
+                                  show_borders=page_has_borders)
 
             if page_idx < num_pages - 1:
                 doc.add_page_break()

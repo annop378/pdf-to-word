@@ -40,7 +40,10 @@ async def convert(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        docx_bytes = convert_pdf_to_word(tmp_path)
+        docx_bytes = convert_pdf_to_word(
+            tmp_path,
+            ai_vision_model=os.environ.get("AI_VISION_MODEL") or None,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}")
     finally:
