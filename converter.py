@@ -2331,7 +2331,13 @@ def convert_pdf_to_word(pdf_path: str, *,
 
             page_has_borders = _has_table_structure(page)
 
-            if not words and not form_fields and _is_fullpage_image(images, page.width, page.height):
+            # When ai_vision_model is set and page has a full-page background image,
+            # always use AI vision — even if words were extracted from an OCR text layer.
+            # OCR text layers (added by ocrmypdf) should NOT suppress AI vision analysis.
+            is_fullpage = _is_fullpage_image(images, page.width, page.height)
+            force_ai_vision = ai_vision_model and is_fullpage and words
+
+            if force_ai_vision or (not words and not form_fields and is_fullpage):
                 # 掃描 PDF：整頁是一張圖
                 used_ai = False
                 if ai_vision_model:
@@ -2349,7 +2355,8 @@ def convert_pdf_to_word(pdf_path: str, *,
                     finally:
                         Path(tmp_img_path).unlink(missing_ok=True)
                 if used_ai:
-                    _log_entries.append(f"page {page_idx+1}: AI vision ({ai_vision_model})")
+                    src = "forced from OCR-text PDF" if force_ai_vision else "scanned PDF"
+                    _log_entries.append(f"page {page_idx+1}: AI vision ({ai_vision_model}) [{src}]")
                 else:
                     _log_entries.append(f"page {page_idx+1}: OCR/img2table (AI vision {'failed' if ai_vision_model else 'not configured'})")
                     _build_ocr_page_table(doc, pdf_path, page_idx,
