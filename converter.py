@@ -2171,14 +2171,30 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
 
     # Try SDK first (avoids Claude Code permission interception), fall back to CLI.
     raw = None
+    _call_errors = []
     for _caller in (_call_claude_sdk_with_image, _call_claude_cli_with_image):
         try:
             raw = _caller(image_path, model=model)
             if raw and len(raw) > 20:
                 break
-        except Exception:
+        except Exception as _exc:
+            _call_errors.append(f"{_caller.__name__}: {type(_exc).__name__}: {_exc}")
             continue
     if not raw:
+        # Log the actual failure reason
+        try:
+            from pathlib import Path as _P
+            import datetime as _dt
+            _log = _P.home() / ".pdf2word" / "ai_vision_error.log"
+            _log.parent.mkdir(parents=True, exist_ok=True)
+            _ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _log.write_text(
+                f"[{_ts}] _build_ai_page_table failed (raw={repr(raw)[:80]}):\n"
+                + "\n".join(_call_errors) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
         return False
 
     # Extract JSON from response (handles markdown fences, leading text, thinking preambles)
