@@ -304,13 +304,24 @@ class App(tk.Tk):
         ttk.Checkbutton(row_btn, text="轉換後自動修正拼字",
                         variable=self._auto_fix_var,
                         command=self._on_auto_fix_toggle).pack(side="left", padx=(10, 0))
-        # Model switch button — shows current model, click to change
+        # Fix model button
         self._fix_model_btn = tk.Button(
             row_btn, text=self._ai_model_var.get(),
             font=("TkDefaultFont", 8), fg="#0055cc", relief="flat",
             cursor="hand2", command=self._pick_fix_model,
         )
         self._fix_model_btn.pack(side="left", padx=(4, 0))
+
+        # ── AI Vision row ─────────────────────────────────────
+        row_vision = tk.Frame(self)
+        row_vision.pack(padx=16, pady=(0, 4), anchor="w")
+        tk.Label(row_vision, text="AI Vision：", fg="#555555").pack(side="left")
+        self._vision_model_btn = tk.Button(
+            row_vision, text=self._ai_vision_model_var.get() or "（停用）",
+            font=("TkDefaultFont", 8), fg="#0055cc", relief="flat",
+            cursor="hand2", command=self._pick_vision_model,
+        )
+        self._vision_model_btn.pack(side="left")
 
         # ── status bar ───────────────────────────────────────
         self._status = tk.StringVar(
@@ -541,6 +552,50 @@ class App(tk.Tk):
 
         dlg.after(100, lambda: dlg.lift())
 
+    def _pick_vision_model(self):
+        """Inline model picker for AI vision conversion."""
+        dlg = tk.Toplevel(self)
+        dlg.title("AI Vision Model")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="選擇掃描 PDF 轉換使用的 AI Vision Model：",
+                 anchor="w").pack(padx=12, pady=(10, 4), fill="x")
+        tk.Label(dlg, text="（留空 = 停用 AI vision，使用 OCR）",
+                 fg="#888888", font=("TkDefaultFont", 8), anchor="w"
+                 ).pack(padx=12, pady=(0, 6), fill="x")
+
+        var = tk.StringVar(value=self._ai_vision_model_var.get())
+        ttk.Radiobutton(dlg, text="（停用）", variable=var, value="").pack(
+            anchor="w", padx=20, pady=1)
+        for m in _PRESET_MODELS[1:]:
+            ttk.Radiobutton(dlg, text=m, variable=var, value=m).pack(
+                anchor="w", padx=20, pady=1)
+
+        custom_frame = tk.Frame(dlg)
+        custom_frame.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Radiobutton(custom_frame, text="自訂：", variable=var, value="__custom__"
+                        ).pack(side="left")
+        custom_var = tk.StringVar()
+        tk.Entry(custom_frame, textvariable=custom_var, width=30).pack(side="left")
+
+        def _confirm():
+            val = var.get()
+            if val == "__custom__":
+                val = custom_var.get().strip()
+            self._ai_vision_model_var.set(val)
+            self._vision_model_btn.config(text=val or "（停用）")
+            self._save_ai_config()
+            dlg.destroy()
+
+        tk.Frame(dlg).pack(pady=4)
+        bf = tk.Frame(dlg)
+        bf.pack(pady=(0, 10))
+        tk.Button(bf, text="確定", width=8, command=_confirm).pack(side="left", padx=4)
+        tk.Button(bf, text="取消", width=8, command=dlg.destroy).pack(side="left")
+        dlg.after(50, lambda: dlg.lift())
+
     def _pick_fix_model(self):
         """Inline model picker for auto-fix — small popup next to the button."""
         dlg = tk.Toplevel(self)
@@ -688,9 +743,14 @@ class App(tk.Tk):
                 self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
             except Exception:
                 pass
-        # Sync model button text after loading config (button may not exist yet on first call)
+        # Sync model button texts after loading config (buttons may not exist yet on first call)
         try:
             self._fix_model_btn.config(text=self._ai_model_var.get())
+        except AttributeError:
+            pass
+        try:
+            self._vision_model_btn.config(
+                text=self._ai_vision_model_var.get() or "（停用）")
         except AttributeError:
             pass
 

@@ -1970,7 +1970,7 @@ def _call_claude_cli_with_image(image_path: str, model: str = "") -> str:
             model_flag = f' --model "{model}"' if model else ""
             cmd = f'chcp 65001 > nul && type "{tmp_path}" | claude -p{model_flag}'
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, env=env, timeout=180)
+                cmd, shell=True, capture_output=True, env=env, timeout=90)
         else:
             args = [claude_exe, "-p"]
             if model:
@@ -2196,8 +2196,9 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
     # Try SDK first (avoids Claude Code permission interception), fall back to CLI.
     raw = None
     _call_errors = []
-    # Only use SDK path — CLI path is unreliable in frozen exe (sandbox + timeout).
-    for _caller in (_call_claude_sdk_with_image,):
+    # Try SDK first (Bedrock SSO), fall back to CLI (Claude Code OAuth).
+    # Both paths are valid depending on the environment.
+    for _caller in (_call_claude_sdk_with_image, _call_claude_cli_with_image):
         try:
             raw = _caller(image_path, model=model)
             if raw and len(raw) > 20:
