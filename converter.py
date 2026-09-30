@@ -1889,14 +1889,31 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
     _bedrock_id = _bedrock_model_map.get(_raw_model, _raw_model)
 
     try:
-        # Resolve region: env var > AWS config > default us-east-1
         import os as _os
         _region = (
             _os.environ.get("AWS_REGION")
             or _os.environ.get("AWS_DEFAULT_REGION")
             or "us-east-1"
         )
-        _client = _anthropic.AnthropicBedrock(aws_region=_region)
+
+        # Resolve credentials explicitly via boto3 session first,
+        # then pass to AnthropicBedrock. This works reliably in frozen exes
+        # where botocore's internal credential chain may not auto-discover.
+        import boto3 as _boto3
+        _session = _boto3.Session()
+        _creds = _session.get_credentials()
+        if _creds is None:
+            raise RuntimeError(
+                "AWS credentials not found. Please run 'aws sso login' first."
+            )
+        _frozen = _creds.get_frozen_credentials()
+
+        _client = _anthropic.AnthropicBedrock(
+            aws_region=_region,
+            aws_access_key=_frozen.access_key,
+            aws_secret_key=_frozen.secret_key,
+            aws_session_token=_frozen.token or None,
+        )
         # Use streaming to support larger responses (Bedrock requires streaming
         # for max_tokens > ~21000). Collect the full text via stream context.
         _text_parts = []
@@ -2179,7 +2196,8 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
     # Try SDK first (avoids Claude Code permission interception), fall back to CLI.
     raw = None
     _call_errors = []
-    for _caller in (_call_claude_sdk_with_image, _call_claude_cli_with_image):
+    # Only use SDK path — CLI path is unreliable in frozen exe (sandbox + timeout).
+    for _caller in (_call_claude_sdk_with_image,):
         try:
             raw = _caller(image_path, model=model)
             if raw and len(raw) > 20:

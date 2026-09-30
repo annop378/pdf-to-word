@@ -271,7 +271,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self._ai_model_var        = tk.StringVar(value="claude-haiku-4-5-20251001")
         self._ai_vision_model_var = tk.StringVar(value="claude-sonnet-5")
-        self._auto_fix_var        = tk.BooleanVar(value=False)
+        self._auto_fix_var        = tk.BooleanVar(value=True)
         self._cancel_flag         = threading.Event()
         self._last_docx_path = None
         self._load_ai_config()
@@ -304,6 +304,13 @@ class App(tk.Tk):
         ttk.Checkbutton(row_btn, text="轉換後自動修正拼字",
                         variable=self._auto_fix_var,
                         command=self._on_auto_fix_toggle).pack(side="left", padx=(10, 0))
+        # Model switch button — shows current model, click to change
+        self._fix_model_btn = tk.Button(
+            row_btn, text=self._ai_model_var.get(),
+            font=("TkDefaultFont", 8), fg="#0055cc", relief="flat",
+            cursor="hand2", command=self._pick_fix_model,
+        )
+        self._fix_model_btn.pack(side="left", padx=(4, 0))
 
         # ── status bar ───────────────────────────────────────
         self._status = tk.StringVar(
@@ -534,6 +541,48 @@ class App(tk.Tk):
 
         dlg.after(100, lambda: dlg.lift())
 
+    def _pick_fix_model(self):
+        """Inline model picker for auto-fix — small popup next to the button."""
+        dlg = tk.Toplevel(self)
+        dlg.title("修正拼字 Model")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="選擇修正拼字使用的 Model：",
+                 anchor="w").pack(padx=12, pady=(10, 4), fill="x")
+
+        var = tk.StringVar(value=self._ai_model_var.get())
+        for m in _PRESET_MODELS[1:]:  # skip the empty default
+            ttk.Radiobutton(dlg, text=m, variable=var, value=m).pack(
+                anchor="w", padx=20, pady=1)
+
+        # custom entry
+        custom_frame = tk.Frame(dlg)
+        custom_frame.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Radiobutton(custom_frame, text="自訂：", variable=var, value="__custom__"
+                        ).pack(side="left")
+        custom_var = tk.StringVar()
+        custom_entry = tk.Entry(custom_frame, textvariable=custom_var, width=25)
+        custom_entry.pack(side="left")
+
+        def _confirm():
+            val = var.get()
+            if val == "__custom__":
+                val = custom_var.get().strip()
+            if val:
+                self._ai_model_var.set(val)
+                self._fix_model_btn.config(text=val)
+                self._save_ai_config()
+            dlg.destroy()
+
+        tk.Frame(dlg).pack(pady=4)
+        bf = tk.Frame(dlg)
+        bf.pack(pady=(0, 10))
+        tk.Button(bf, text="確定", width=8, command=_confirm).pack(side="left", padx=4)
+        tk.Button(bf, text="取消", width=8, command=dlg.destroy).pack(side="left")
+        dlg.after(50, lambda: dlg.lift())
+
     def _on_auto_fix_toggle(self):
         """勾選「自動修正拼字」時，立即開啟 AI 設定並驗證連線。"""
         if self._auto_fix_var.get():
@@ -639,6 +688,11 @@ class App(tk.Tk):
                 self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
             except Exception:
                 pass
+        # Sync model button text after loading config (button may not exist yet on first call)
+        try:
+            self._fix_model_btn.config(text=self._ai_model_var.get())
+        except AttributeError:
+            pass
 
     def _save_ai_config(self):
         _CONF_DIR.mkdir(parents=True, exist_ok=True)
