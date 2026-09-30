@@ -1889,7 +1889,14 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
     _bedrock_id = _bedrock_model_map.get(_raw_model, _raw_model)
 
     try:
-        _client = _anthropic.AnthropicBedrock()
+        # Resolve region: env var > AWS config > default us-east-1
+        import os as _os
+        _region = (
+            _os.environ.get("AWS_REGION")
+            or _os.environ.get("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+        _client = _anthropic.AnthropicBedrock(aws_region=_region)
         # Use streaming to support larger responses (Bedrock requires streaming
         # for max_tokens > ~21000). Collect the full text via stream context.
         _text_parts = []
@@ -2343,6 +2350,7 @@ def convert_pdf_to_word(pdf_path: str, *,
         section.bottom_margin = Inches(0.75)
 
     _log_entries = []
+    _ai_vision_disabled = False  # set True after first AI vision failure to skip remaining pages
 
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
@@ -2385,7 +2393,7 @@ def convert_pdf_to_word(pdf_path: str, *,
             if force_ai_vision or (not words and not form_fields and is_fullpage):
                 # 掃描 PDF：整頁是一張圖
                 used_ai = False
-                if ai_vision_model:
+                if ai_vision_model and not _ai_vision_disabled:
                     pil_img = _page_to_pil(pdf_path, page_idx, dpi=200)
                     # Save temp image next to the exe (or PDF) to ensure read permissions.
                     # Claude Code's sandbox blocks access to system temp dirs.
@@ -2405,7 +2413,9 @@ def convert_pdf_to_word(pdf_path: str, *,
                     src = "forced from OCR-text PDF" if force_ai_vision else "scanned PDF"
                     _log_entries.append(f"page {page_idx+1}: AI vision ({ai_vision_model}) [{src}]")
                 else:
-                    _log_entries.append(f"page {page_idx+1}: OCR/img2table (AI vision {'failed' if ai_vision_model else 'not configured'})")
+                    if ai_vision_model and not _ai_vision_disabled:
+                        _ai_vision_disabled = True  # stop retrying on subsequent pages
+                    _log_entries.append(f"page {page_idx+1}: OCR/img2table (AI vision {'failed - disabled for remaining pages' if _ai_vision_disabled else 'not configured'})")
                     _build_ocr_page_table(doc, pdf_path, page_idx,
                                           page_width=page.width,
                                           page_height=page.height)
