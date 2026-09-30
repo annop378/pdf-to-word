@@ -2178,7 +2178,21 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
             if raw and len(raw) > 20:
                 break
         except Exception as _exc:
-            _call_errors.append(f"{_caller.__name__}: {type(_exc).__name__}: {_exc}")
+            err_msg = f"{_caller.__name__}: {type(_exc).__name__}: {_exc}"
+            _call_errors.append(err_msg)
+            # Always log SDK errors immediately (even if CLI succeeds)
+            if _caller is _call_claude_sdk_with_image:
+                try:
+                    from pathlib import Path as _Px
+                    import datetime as _dtx
+                    _lx = _Px.home() / ".pdf2word" / "ai_vision_error.log"
+                    _lx.parent.mkdir(parents=True, exist_ok=True)
+                    _lx.write_text(
+                        f"[{_dtx.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SDK error: {err_msg}\n",
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             continue
     if not raw:
         # Log the actual failure reason
@@ -2373,8 +2387,10 @@ def convert_pdf_to_word(pdf_path: str, *,
                 used_ai = False
                 if ai_vision_model:
                     pil_img = _page_to_pil(pdf_path, page_idx, dpi=200)
-                    tmp_img_fd, tmp_img_path = tempfile.mkstemp(suffix=".png")
-                    os.close(tmp_img_fd)
+                    # Save temp image next to the exe (or PDF) to ensure read permissions.
+                    # Claude Code's sandbox blocks access to system temp dirs.
+                    _exe_dir = Path(getattr(sys, "executable", __file__)).parent
+                    tmp_img_path = str(_exe_dir / f"_ai_page_{page_idx}.png")
                     try:
                         pil_img.save(tmp_img_path, format="PNG")
                         used_ai = _build_ai_page_table(
