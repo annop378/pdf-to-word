@@ -1889,30 +1889,52 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
     _bedrock_id = _bedrock_model_map.get(_raw_model, _raw_model)
 
     try:
-        import os as _os
+        import os as _os, subprocess as _sp, json as _json_creds
         _region = (
             _os.environ.get("AWS_REGION")
             or _os.environ.get("AWS_DEFAULT_REGION")
             or "us-east-1"
         )
 
-        # Resolve credentials explicitly via boto3 session first,
-        # then pass to AnthropicBedrock. This works reliably in frozen exes
-        # where botocore's internal credential chain may not auto-discover.
-        import boto3 as _boto3
-        _session = _boto3.Session()
-        _creds = _session.get_credentials()
-        if _creds is None:
-            raise RuntimeError(
-                "AWS credentials not found. Please run 'aws sso login' first."
+        # Resolve credentials via AWS CLI subprocess — most reliable in frozen exes
+        # where botocore's SSO chain may not auto-discover cached tokens.
+        # Falls back to boto3 Session if aws CLI is unavailable.
+        _access_key = _secret_key = _token = None
+        try:
+            _r = _sp.run(
+                ["aws", "configure", "export-credentials", "--format", "env-no-export"],
+                capture_output=True, text=True, timeout=15,
             )
-        _frozen = _creds.get_frozen_credentials()
+            if _r.returncode == 0:
+                for _line in _r.stdout.splitlines():
+                    _k, _, _v = _line.partition("=")
+                    if _k == "AWS_ACCESS_KEY_ID":   _access_key = _v
+                    if _k == "AWS_SECRET_ACCESS_KEY": _secret_key = _v
+                    if _k == "AWS_SESSION_TOKEN":    _token = _v
+        except Exception:
+            pass
+
+        if not (_access_key and _secret_key):
+            # Fallback: try boto3 session
+            try:
+                import boto3 as _boto3
+                _creds = _boto3.Session().get_credentials()
+                if _creds:
+                    _f = _creds.get_frozen_credentials()
+                    _access_key, _secret_key, _token = _f.access_key, _f.secret_key, _f.token
+            except Exception:
+                pass
+
+        if not (_access_key and _secret_key):
+            raise RuntimeError(
+                "AWS credentials not found. Run 'aws sso login' to refresh."
+            )
 
         _client = _anthropic.AnthropicBedrock(
             aws_region=_region,
-            aws_access_key=_frozen.access_key,
-            aws_secret_key=_frozen.secret_key,
-            aws_session_token=_frozen.token or None,
+            aws_access_key=_access_key,
+            aws_secret_key=_secret_key,
+            aws_session_token=_token or None,
         )
         # Use streaming to support larger responses (Bedrock requires streaming
         # for max_tokens > ~21000). Collect the full text via stream context.
@@ -1970,7 +1992,7 @@ def _call_claude_cli_with_image(image_path: str, model: str = "") -> str:
             model_flag = f' --model "{model}"' if model else ""
             cmd = f'chcp 65001 > nul && type "{tmp_path}" | claude -p{model_flag}'
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, env=env, timeout=90)
+                cmd, shell=True, capture_output=True, env=env, timeout=300)
         else:
             args = [claude_exe, "-p"]
             if model:
@@ -2196,9 +2218,9 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
     # Try SDK first (avoids Claude Code permission interception), fall back to CLI.
     raw = None
     _call_errors = []
-    # Try SDK first (Bedrock SSO), fall back to CLI (Claude Code OAuth).
-    # Both paths are valid depending on the environment.
-    for _caller in (_call_claude_sdk_with_image, _call_claude_cli_with_image):
+    # CLI first (same claude -p OAuth as text correction, no AWS needed),
+    # fall back to Bedrock SDK if CLI unavailable or fails.
+    for _caller in (_call_claude_cli_with_image, _call_claude_sdk_with_image):
         try:
             raw = _caller(image_path, model=model)
             if raw and len(raw) > 20:
@@ -2206,8 +2228,8 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
         except Exception as _exc:
             err_msg = f"{_caller.__name__}: {type(_exc).__name__}: {_exc}"
             _call_errors.append(err_msg)
-            # Always log SDK errors immediately (even if CLI succeeds)
-            if _caller is _call_claude_sdk_with_image:
+            # Always log the first caller's error immediately
+            if _caller is _call_claude_cli_with_image:
                 try:
                     from pathlib import Path as _Px
                     import datetime as _dtx
