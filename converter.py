@@ -2249,10 +2249,40 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
                                 page_width_pt=page_width,
                                 page_height_pt=page_height)
 
+    # Log successful AI vision result to conversion.log
+    try:
+        from pathlib import Path as _P
+        import datetime as _dt
+        _log = _P.home() / ".pdf2word" / "conversion.log"
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        _ts = _dt.datetime.now().strftime("%H:%M:%S")
+        _entry = f"  [{_ts}] AI vision OK: model={model}, sections={len(sections)}, raw_len={len(raw)}\n"
+        _existing = _log.read_text(encoding="utf-8") if _log.exists() else ""
+        _log.write_text(_entry + _existing, encoding="utf-8")
+    except Exception:
+        pass
+
     return True
 
 
 # ── main entry ────────────────────────────────────────────────────────────────
+def _write_conversion_log(pdf_path: str, entries: list):
+    """Write per-page conversion path info to ~/.pdf2word/conversion.log."""
+    try:
+        from pathlib import Path as _P
+        import datetime as _dt
+        log_dir = _P.home() / ".pdf2word"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"[{ts}] {_P(pdf_path).name}"]
+        lines += [f"  {e}" for e in entries]
+        log_path = log_dir / "conversion.log"
+        existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        log_path.write_text("\n".join(lines) + "\n\n" + existing, encoding="utf-8")
+    except Exception:
+        pass
+
+
 def convert_pdf_to_word(pdf_path: str, *,
                         ai_vision_model: str = None) -> bytes:
     doc = Document()
@@ -2266,6 +2296,8 @@ def convert_pdf_to_word(pdf_path: str, *,
         section.right_margin  = Inches(0.75)
         section.top_margin    = Inches(0.75)
         section.bottom_margin = Inches(0.75)
+
+    _log_entries = []
 
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
@@ -2301,7 +2333,6 @@ def convert_pdf_to_word(pdf_path: str, *,
 
             if not words and not form_fields and _is_fullpage_image(images, page.width, page.height):
                 # 掃描 PDF：整頁是一張圖
-                # 有指定 AI model 時，先存成暫存 PNG 再交給 claude CLI 分析
                 used_ai = False
                 if ai_vision_model:
                     pil_img = _page_to_pil(pdf_path, page_idx, dpi=200)
@@ -2317,13 +2348,18 @@ def convert_pdf_to_word(pdf_path: str, *,
                         )
                     finally:
                         Path(tmp_img_path).unlink(missing_ok=True)
-                if not used_ai:
+                if used_ai:
+                    _log_entries.append(f"page {page_idx+1}: AI vision ({ai_vision_model})")
+                else:
+                    _log_entries.append(f"page {page_idx+1}: OCR/img2table (AI vision {'failed' if ai_vision_model else 'not configured'})")
                     _build_ocr_page_table(doc, pdf_path, page_idx,
                                           page_width=page.width,
                                           page_height=page.height)
             elif not words and not images and not form_fields:
+                _log_entries.append(f"page {page_idx+1}: plain-OCR (no content detected)")
                 _build_ocr_page(doc, pdf_path, page_idx)
             else:
+                _log_entries.append(f"page {page_idx+1}: text-PDF (pdfplumber, words={len(words)})")
                 rows = _group_rows(words, blanks, images,
                                    page_width=page.width,
                                    form_fields=form_fields)
@@ -2333,6 +2369,8 @@ def convert_pdf_to_word(pdf_path: str, *,
 
             if page_idx < num_pages - 1:
                 doc.add_page_break()
+
+    _write_conversion_log(pdf_path, _log_entries)
 
     buf = io.BytesIO()
     doc.save(buf)
