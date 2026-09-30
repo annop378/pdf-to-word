@@ -10,6 +10,9 @@ anyio_datas,      anyio_binaries,      anyio_hiddenimports      = collect_all("a
 httpx_datas,      httpx_binaries,      httpx_hiddenimports      = collect_all("httpx")
 httpcore_datas,   httpcore_binaries,   httpcore_hiddenimports   = collect_all("httpcore")
 sniffio_datas,    sniffio_binaries,    sniffio_hiddenimports    = collect_all("sniffio")
+# 完整收集 boto3/botocore（SSO credential provider 需要所有子模組與資料檔）
+boto3_datas,      boto3_binaries,      boto3_hiddenimports      = collect_all("boto3")
+botocore_datas,   botocore_binaries,   botocore_hiddenimports   = collect_all("botocore")
 
 TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")
 
@@ -29,7 +32,7 @@ for f in (TESSERACT_DIR / "tessdata").rglob("*"):
 a = Analysis(
     ["gui.py"],
     pathex=["."],
-    binaries=tess_binaries + anthropic_binaries + anyio_binaries + httpx_binaries + httpcore_binaries + sniffio_binaries,
+    binaries=tess_binaries + anthropic_binaries + anyio_binaries + httpx_binaries + httpcore_binaries + sniffio_binaries + boto3_binaries + botocore_binaries,
     datas=[
         *tessdata_files,
         *anthropic_datas,
@@ -37,6 +40,8 @@ a = Analysis(
         *httpx_datas,
         *httpcore_datas,
         *sniffio_datas,
+        *boto3_datas,
+        *botocore_datas,
     ],
     hiddenimports=[
         "pdfplumber",
@@ -55,7 +60,8 @@ a = Analysis(
         *httpx_hiddenimports,
         *httpcore_hiddenimports,
         *sniffio_hiddenimports,
-        "boto3",
+        *boto3_hiddenimports,
+        *botocore_hiddenimports,
         "boto3.session",
         "botocore",
         "botocore.session",
