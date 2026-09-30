@@ -2197,40 +2197,54 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
             pass
         return False
 
+    def _ai_fail_log(reason: str):
+        try:
+            from pathlib import Path as _P2
+            import datetime as _dt2
+            _log2 = _P2.home() / ".pdf2word" / "ai_vision_error.log"
+            _log2.parent.mkdir(parents=True, exist_ok=True)
+            _ts2 = _dt2.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _log2.write_text(
+                f"[{_ts2}] {reason}\nraw_len={len(raw)}, raw_preview={repr(raw[:200])}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     # Extract JSON from response (handles markdown fences, leading text, thinking preambles)
     import re as _re
     stripped = raw.strip()
-    # Strip markdown code fences if present
     if stripped.startswith("```"):
         stripped = stripped.split("```")[1]
         if stripped.startswith("json"):
             stripped = stripped[4:]
         stripped = stripped.strip()
-    # If still not starting with { or [, find the first JSON object/array
     if not stripped.startswith(("{", "[")):
         _m = _re.search(r'[{\[]', stripped)
         if _m:
             stripped = stripped[_m.start():]
         else:
+            _ai_fail_log(f"no JSON start found in raw response")
             return False
-    # Trim trailing content after the closing brace/bracket
     try:
         layout = _json.loads(stripped)
-    except Exception:
+    except Exception as _je:
         try:
             _end = max(stripped.rfind("}"), stripped.rfind("]"))
             if _end > 0:
                 layout = _json.loads(stripped[:_end + 1])
             else:
+                _ai_fail_log(f"JSON parse failed (no closing brace): {_je}")
                 return False
-        except Exception:
+        except Exception as _je2:
+            _ai_fail_log(f"JSON parse failed: {_je} / retry: {_je2}")
             return False
 
-    # Support both new sections format and legacy flat rows format
     sections = layout.get("sections")
     if not sections:
         flat_rows = layout.get("rows", [])
         if not flat_rows:
+            _ai_fail_log(f"JSON parsed OK but no sections/rows. keys={list(layout.keys())}")
             return False
         num_cols = max(
             (sum(c.get("colspan", 1) for c in r.get("cells", [])) for r in flat_rows),
@@ -2239,6 +2253,7 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
         sections = [{"num_cols": num_cols, "rows": flat_rows}]
 
     if not sections:
+        _ai_fail_log(f"sections empty after processing")
         return False
 
     TWI = 20
