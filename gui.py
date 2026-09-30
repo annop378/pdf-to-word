@@ -252,11 +252,12 @@ def _label_for(path: Path) -> str:
     return "Unknown format"
 
 
-def _convert(path: str, ai_vision_model: str = "") -> bytes:
+def _convert(path: str, ai_vision_model: str = "", aws_profile: str = "") -> bytes:
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
         return convert_pdf_to_word(path,
-                                   ai_vision_model=ai_vision_model or None)
+                                   ai_vision_model=ai_vision_model or None,
+                                   aws_profile=aws_profile or None)
     if ext == ".docx":
         return convert_word_to_word(path)
     if ext in IMAGE_EXTS:
@@ -271,6 +272,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self._ai_model_var        = tk.StringVar(value="claude-haiku-4-5-20251001")
         self._ai_vision_model_var = tk.StringVar(value="claude-sonnet-5")
+        self._aws_profile_var     = tk.StringVar(value="")
         self._auto_fix_var        = tk.BooleanVar(value=True)
         self._cancel_flag         = threading.Event()
         self._last_docx_path = None
@@ -425,7 +427,8 @@ class App(tk.Tk):
 
             self.after(0, lambda: self._status.set("轉換中…"))
             docx_bytes = _convert(actual_src,
-                                   ai_vision_model=_vision_model)
+                                   ai_vision_model=_vision_model,
+                                   aws_profile=self._aws_profile_var.get().strip())
             out_path = src_path.with_suffix(".docx")
             if out_path == src_path:
                 out_path = src_path.with_stem(src_path.stem + "_table")
@@ -580,12 +583,20 @@ class App(tk.Tk):
         custom_var = tk.StringVar()
         tk.Entry(custom_frame, textvariable=custom_var, width=30).pack(side="left")
 
+        # AWS Profile
+        pf = tk.Frame(dlg)
+        pf.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(pf, text="AWS Profile（留空用 default）：", anchor="w").pack(side="left")
+        profile_var = tk.StringVar(value=self._aws_profile_var.get())
+        tk.Entry(pf, textvariable=profile_var, width=20).pack(side="left", padx=(4, 0))
+
         def _confirm():
             val = var.get()
             if val == "__custom__":
                 val = custom_var.get().strip()
             self._ai_vision_model_var.set(val)
             self._vision_model_btn.config(text=val or "（停用）")
+            self._aws_profile_var.set(profile_var.get().strip())
             self._save_ai_config()
             dlg.destroy()
 
@@ -741,6 +752,7 @@ class App(tk.Tk):
                 cfg = json.loads(_AI_CONFIG_PATH.read_text(encoding="utf-8"))
                 self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-4-5-20251001"))
                 self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
+                self._aws_profile_var.set(cfg.get("aws_profile", ""))
             except Exception:
                 pass
         # Sync model button texts after loading config (buttons may not exist yet on first call)
@@ -759,6 +771,7 @@ class App(tk.Tk):
         cfg = {
             "claude_model":        self._ai_model_var.get().strip(),
             "claude_vision_model": self._ai_vision_model_var.get().strip(),
+            "aws_profile":         self._aws_profile_var.get().strip(),
         }
         _AI_CONFIG_PATH.write_text(
             json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"

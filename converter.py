@@ -1832,7 +1832,8 @@ Borders: set true only when a visible line exists on that side.
 """
 
 
-def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
+def _call_claude_sdk_with_image(image_path: str, model: str = "",
+                                aws_profile: str = None) -> str:
     """
     Call Claude directly via the Anthropic Python SDK with a base64-encoded image.
     Supports both direct API key (ANTHROPIC_API_KEY) and AWS Bedrock SSO.
@@ -1900,9 +1901,11 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
         # where botocore's SSO chain may not auto-discover cached tokens.
         # Falls back to boto3 Session if aws CLI is unavailable.
         _access_key = _secret_key = _token = None
+        _profile_flags = ["--profile", aws_profile] if aws_profile else []
         try:
             _r = _sp.run(
-                ["aws", "configure", "export-credentials", "--format", "env-no-export"],
+                ["aws", "configure", "export-credentials",
+                 "--format", "env-no-export"] + _profile_flags,
                 capture_output=True, text=True, timeout=15,
             )
             if _r.returncode == 0:
@@ -1918,7 +1921,7 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "") -> str:
             # Fallback: try boto3 session
             try:
                 import boto3 as _boto3
-                _creds = _boto3.Session().get_credentials()
+                _creds = _boto3.Session(profile_name=aws_profile or None).get_credentials()
                 if _creds:
                     _f = _creds.get_frozen_credentials()
                     _access_key, _secret_key, _token = _f.access_key, _f.secret_key, _f.token
@@ -2207,7 +2210,8 @@ def _build_ai_section_table(doc: Document, section: dict,
 
 
 def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
-                          page_height: float, model: str, pil_img=None):
+                          page_height: float, model: str, pil_img=None,
+                          aws_profile: str = None):
     """
     Send the page image to Claude via CLI, receive sections-based JSON,
     then build one Word table per section.
@@ -2220,7 +2224,10 @@ def _build_ai_page_table(doc: Document, image_path: str, page_width: float,
     _call_errors = []
     # CLI first (same claude -p OAuth as text correction, no AWS needed),
     # fall back to Bedrock SDK if CLI unavailable or fails.
-    for _caller in (_call_claude_cli_with_image, _call_claude_sdk_with_image):
+    def _sdk_caller(img_path, model):
+        return _call_claude_sdk_with_image(img_path, model=model, aws_profile=aws_profile)
+
+    for _caller in (_call_claude_cli_with_image, _sdk_caller):
         try:
             raw = _caller(image_path, model=model)
             if raw and len(raw) > 20:
@@ -2377,7 +2384,8 @@ def _write_conversion_log(pdf_path: str, entries: list):
 
 
 def convert_pdf_to_word(pdf_path: str, *,
-                        ai_vision_model: str = None) -> bytes:
+                        ai_vision_model: str = None,
+                        aws_profile: str = None) -> bytes:
     doc = Document()
     _reset_doc_spacing(doc)
 
@@ -2447,6 +2455,7 @@ def convert_pdf_to_word(pdf_path: str, *,
                             page_width=page.width, page_height=page.height,
                             model=ai_vision_model,
                             pil_img=pil_img,
+                            aws_profile=aws_profile,
                         )
                     finally:
                         Path(tmp_img_path).unlink(missing_ok=True)
