@@ -2136,6 +2136,21 @@ def _build_ai_section_table(doc: Document, section: dict,
             is_image = bool(cell_def.get("is_image", False))
             img_region = cell_def.get("image_region")
             cx0 = cx1 = cy0 = cy1 = 0  # track crop bounds for text-skip logic
+            if is_image and img_region:
+                # Log image region for debugging layout issues
+                try:
+                    from pathlib import Path as _Plog
+                    import datetime as _dtlog
+                    _lp = _Plog.home() / ".pdf2word" / "conversion.log"
+                    _lp.parent.mkdir(parents=True, exist_ok=True)
+                    _existing = _lp.read_text(encoding="utf-8") if _lp.exists() else ""
+                    _ts = _dtlog.datetime.now().strftime("%H:%M:%S")
+                    _lp.write_text(
+                        f"  [{_ts}] image_region={img_region}, text={repr(cell_def.get('text','')[:30])}\n" + _existing,
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             if is_image and pil_img is not None and img_region and page_width_pt > 0:
                 try:
                     iw, ih = pil_img.size
@@ -2150,21 +2165,8 @@ def _build_ai_section_table(doc: Document, section: dict,
                     cy1 = min(ih, int((y_pct + h_pct) * ih))
                     if cx1 > cx0 and cy1 > cy0:
                         cropped = pil_img.crop((cx0, cy0, cx1, cy1))
-                        # Auto-trim white/near-white border using PIL threshold
-                        try:
-                            _gray = cropped.convert("L")
-                            # Find bbox of pixels darker than 240 (non-white content)
-                            _mask = _gray.point(lambda p: 255 if p < 240 else 0)
-                            _bbox = _mask.getbbox()
-                            if _bbox and (_bbox[2] - _bbox[0]) > 10 and (_bbox[3] - _bbox[1]) > 10:
-                                pad = 6
-                                cropped = cropped.crop((
-                                    max(0, _bbox[0] - pad), max(0, _bbox[1] - pad),
-                                    min(cropped.width, _bbox[2] + pad),
-                                    min(cropped.height, _bbox[3] + pad),
-                                ))
-                        except Exception:
-                            pass  # keep original crop if autocrop fails
+                        # Note: no autocrop — use Claude's image_region as-is.
+                        # Autocrop was removed because it incorrectly clipped seal edges.
                         buf = io.BytesIO()
                         cropped.save(buf, format="PNG")
                         buf.seek(0)
