@@ -2385,7 +2385,12 @@ def _write_conversion_log(pdf_path: str, entries: list):
 
 def convert_pdf_to_word(pdf_path: str, *,
                         ai_vision_model: str = None,
-                        aws_profile: str = None) -> bytes:
+                        aws_profile: str = None,
+                        progress_callback=None) -> bytes:
+    """
+    progress_callback(page_idx, num_pages, status_msg): optional callable
+    called after each page to report progress to GUI.
+    """
     doc = Document()
     _reset_doc_spacing(doc)
 
@@ -2400,6 +2405,16 @@ def convert_pdf_to_word(pdf_path: str, *,
 
     _log_entries = []
     _ai_vision_disabled = False  # set True after first AI vision failure to skip remaining pages
+
+    def _page_done(page_idx, num_pages, msg):
+        """Write page log immediately and notify GUI."""
+        _log_entries.append(msg)
+        _write_conversion_log(pdf_path, [msg])  # flush per-page
+        if progress_callback:
+            try:
+                progress_callback(page_idx, num_pages, msg)
+            except Exception:
+                pass
 
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
@@ -2461,19 +2476,19 @@ def convert_pdf_to_word(pdf_path: str, *,
                         Path(tmp_img_path).unlink(missing_ok=True)
                 if used_ai:
                     src = "forced from OCR-text PDF" if force_ai_vision else "scanned PDF"
-                    _log_entries.append(f"page {page_idx+1}: AI vision ({ai_vision_model}) [{src}]")
+                    _page_done(page_idx, num_pages, f"page {page_idx+1}: AI vision ({ai_vision_model}) [{src}]")
                 else:
                     if ai_vision_model and not _ai_vision_disabled:
                         _ai_vision_disabled = True  # stop retrying on subsequent pages
-                    _log_entries.append(f"page {page_idx+1}: OCR/img2table (AI vision {'failed - disabled for remaining pages' if _ai_vision_disabled else 'not configured'})")
+                    _page_done(page_idx, num_pages, f"page {page_idx+1}: OCR/img2table (AI vision {'failed - disabled for remaining pages' if _ai_vision_disabled else 'not configured'})")
                     _build_ocr_page_table(doc, pdf_path, page_idx,
                                           page_width=page.width,
                                           page_height=page.height)
             elif not words and not images and not form_fields:
-                _log_entries.append(f"page {page_idx+1}: plain-OCR (no content detected)")
+                _page_done(page_idx, num_pages, f"page {page_idx+1}: plain-OCR (no content detected)")
                 _build_ocr_page(doc, pdf_path, page_idx)
             else:
-                _log_entries.append(f"page {page_idx+1}: text-PDF (pdfplumber, words={len(words)})")
+                _page_done(page_idx, num_pages, f"page {page_idx+1}: text-PDF (pdfplumber, words={len(words)})")
                 rows = _group_rows(words, blanks, images,
                                    page_width=page.width,
                                    form_fields=form_fields)

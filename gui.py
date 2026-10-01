@@ -252,12 +252,14 @@ def _label_for(path: Path) -> str:
     return "Unknown format"
 
 
-def _convert(path: str, ai_vision_model: str = "", aws_profile: str = "") -> bytes:
+def _convert(path: str, ai_vision_model: str = "", aws_profile: str = "",
+             progress_callback=None) -> bytes:
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
         return convert_pdf_to_word(path,
                                    ai_vision_model=ai_vision_model or None,
-                                   aws_profile=aws_profile or None)
+                                   aws_profile=aws_profile or None,
+                                   progress_callback=progress_callback)
     if ext == ".docx":
         return convert_word_to_word(path)
     if ext in IMAGE_EXTS:
@@ -272,7 +274,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self._ai_model_var        = tk.StringVar(value="claude-haiku-4-5-20251001")
         self._ai_vision_model_var = tk.StringVar(value="claude-sonnet-5")
-        self._aws_profile_var     = tk.StringVar(value="")
+        self._aws_profile_var     = tk.StringVar(value="genai-dev")
         self._auto_fix_var        = tk.BooleanVar(value=True)
         self._cancel_flag         = threading.Event()
         self._last_docx_path = None
@@ -425,10 +427,16 @@ class App(tk.Tk):
                 elif _missing:
                     self.after(0, lambda: self._status.set("已安裝缺少的套件，開始轉換…"))
 
-            self.after(0, lambda: self._status.set("轉換中…"))
+            self.after(0, lambda: self._status.set("轉換中… (第 1 頁)"))
+
+            def _on_page_progress(page_idx, num_pages, msg):
+                label = f"轉換中… ({page_idx+1}/{num_pages} 頁) {msg.split(':',1)[-1].strip()[:40]}"
+                self.after(0, lambda m=label: self._status.set(m))
+
             docx_bytes = _convert(actual_src,
                                    ai_vision_model=_vision_model,
-                                   aws_profile=self._aws_profile_var.get().strip())
+                                   aws_profile=self._aws_profile_var.get().strip(),
+                                   progress_callback=_on_page_progress)
             out_path = src_path.with_suffix(".docx")
             if out_path == src_path:
                 out_path = src_path.with_stem(src_path.stem + "_table")
@@ -752,7 +760,7 @@ class App(tk.Tk):
                 cfg = json.loads(_AI_CONFIG_PATH.read_text(encoding="utf-8"))
                 self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-4-5-20251001"))
                 self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
-                self._aws_profile_var.set(cfg.get("aws_profile", ""))
+                self._aws_profile_var.set(cfg.get("aws_profile", "genai-dev"))
             except Exception:
                 pass
         # Sync model button texts after loading config (buttons may not exist yet on first call)
