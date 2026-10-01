@@ -2135,6 +2135,7 @@ def _build_ai_section_table(doc: Document, section: dict,
             # ── Image / Logo region ──────────────────────────────────────
             is_image = bool(cell_def.get("is_image", False))
             img_region = cell_def.get("image_region")
+            cx0 = cx1 = cy0 = cy1 = 0  # track crop bounds for text-skip logic
             if is_image and pil_img is not None and img_region and page_width_pt > 0:
                 try:
                     iw, ih = pil_img.size
@@ -2183,7 +2184,10 @@ def _build_ai_section_table(doc: Document, section: dict,
                     pass  # image crop failed, fall through to text
 
             # ── Text ─────────────────────────────────────────────────────
-            text      = str(cell_def.get("text", ""))
+            # Skip text for image cells — Claude may OCR the seal as letters
+            # (e.g. "S"), adding redundant text alongside the embedded image.
+            _image_was_embedded = is_image and img_region and cx1 > cx0 and cy1 > cy0
+            text      = "" if _image_was_embedded else str(cell_def.get("text", ""))
             is_blank  = bool(cell_def.get("is_blank", False))
             bold      = bool(cell_def.get("bold",   False))
             italic    = bool(cell_def.get("italic", False))
@@ -2196,9 +2200,7 @@ def _build_ai_section_table(doc: Document, section: dict,
 
             lines = text.split("\n") if text.strip() else [""]
             for line_idx, line in enumerate(lines):
-                # if we already added an image, add text as separate paragraph
-                start_idx = 1 if (is_image and img_region) else 0
-                if line_idx == 0 and not (is_image and img_region):
+                if line_idx == 0 and not _image_was_embedded:
                     para = word_cell.paragraphs[0]
                 else:
                     para = word_cell.add_paragraph()
