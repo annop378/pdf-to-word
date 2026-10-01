@@ -2150,18 +2150,14 @@ def _build_ai_section_table(doc: Document, section: dict,
                     cy1 = min(ih, int((y_pct + h_pct) * ih))
                     if cx1 > cx0 and cy1 > cy0:
                         cropped = pil_img.crop((cx0, cy0, cx1, cy1))
-                        # Auto-trim white/near-white border around logo/seal
+                        # Auto-trim white/near-white border using PIL threshold
                         try:
-                            _bg = PILImage.new("RGB", cropped.size, (255, 255, 255))
-                            _diff = PILImage.fromarray(
-                                __import__("numpy").abs(
-                                    __import__("numpy").array(cropped.convert("RGB"), dtype=int)
-                                    - __import__("numpy").array(_bg, dtype=int)
-                                ).astype("uint8")
-                            )
-                            _bbox = _diff.convert("L").point(lambda p: 255 if p > 15 else 0).getbbox()
-                            if _bbox:
-                                pad = 4
+                            _gray = cropped.convert("L")
+                            # Find bbox of pixels darker than 240 (non-white content)
+                            _mask = _gray.point(lambda p: 255 if p < 240 else 0)
+                            _bbox = _mask.getbbox()
+                            if _bbox and (_bbox[2] - _bbox[0]) > 10 and (_bbox[3] - _bbox[1]) > 10:
+                                pad = 6
                                 cropped = cropped.crop((
                                     max(0, _bbox[0] - pad), max(0, _bbox[1] - pad),
                                     min(cropped.width, _bbox[2] + pad),
