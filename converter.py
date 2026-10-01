@@ -2091,9 +2091,8 @@ def _build_ai_section_table(doc: Document, section: dict,
 
     for r_idx, ai_row in enumerate(rows):
         tbl_row = tbl.rows[r_idx]
-        h_pt = float(ai_row.get("height_pt", 15))
-        if h_pt > 2:
-            _set_row_height(tbl_row, h_pt, exact=False)
+        # Do NOT set row height from Claude estimates — they tend to over-estimate,
+        # making the document longer than the original PDF. Let Word size rows by content.
 
         cells_def = ai_row.get("cells", [])
         col_cursor = 0
@@ -2150,6 +2149,25 @@ def _build_ai_section_table(doc: Document, section: dict,
                     cy1 = min(ih, int((y_pct + h_pct) * ih))
                     if cx1 > cx0 and cy1 > cy0:
                         cropped = pil_img.crop((cx0, cy0, cx1, cy1))
+                        # Auto-trim white/near-white border around logo/seal
+                        try:
+                            _bg = PILImage.new("RGB", cropped.size, (255, 255, 255))
+                            _diff = PILImage.fromarray(
+                                __import__("numpy").abs(
+                                    __import__("numpy").array(cropped.convert("RGB"), dtype=int)
+                                    - __import__("numpy").array(_bg, dtype=int)
+                                ).astype("uint8")
+                            )
+                            _bbox = _diff.convert("L").point(lambda p: 255 if p > 15 else 0).getbbox()
+                            if _bbox:
+                                pad = 4
+                                cropped = cropped.crop((
+                                    max(0, _bbox[0] - pad), max(0, _bbox[1] - pad),
+                                    min(cropped.width, _bbox[2] + pad),
+                                    min(cropped.height, _bbox[3] + pad),
+                                ))
+                        except Exception:
+                            pass  # keep original crop if autocrop fails
                         buf = io.BytesIO()
                         cropped.save(buf, format="PNG")
                         buf.seek(0)
