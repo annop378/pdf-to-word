@@ -92,11 +92,13 @@ _AI_PROMPT_DEFAULT = """\
 
 _PRESET_MODELS = [
     "",
+    "claude-haiku-5-5",
     "claude-sonnet-5",
     "claude-opus-5",
     "claude-haiku-4-5-20251001",
     "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "us.anthropic.claude-haiku-5-5",
 ]
 
 _AI_FIX_PROMPT = """\
@@ -272,7 +274,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Document to Word Converter")
         self.resizable(False, False)
-        self._ai_model_var        = tk.StringVar(value="claude-haiku-4-5-20251001")
+        self._ai_model_var        = tk.StringVar(value="claude-haiku-5-5")
         self._ai_vision_model_var = tk.StringVar(value="claude-sonnet-5")
         self._aws_profile_var     = tk.StringVar(value="genai-dev")
         self._auto_fix_var        = tk.BooleanVar(value=True)
@@ -758,7 +760,7 @@ class App(tk.Tk):
         if _AI_CONFIG_PATH.exists():
             try:
                 cfg = json.loads(_AI_CONFIG_PATH.read_text(encoding="utf-8"))
-                self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-4-5-20251001"))
+                self._ai_model_var.set(cfg.get("claude_model", "claude-haiku-5-5"))
                 self._ai_vision_model_var.set(cfg.get("claude_vision_model", "claude-sonnet-5"))
                 self._aws_profile_var.set(cfg.get("aws_profile", "genai-dev"))
             except Exception:

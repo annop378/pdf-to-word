@@ -6,6 +6,11 @@
 
 ## [Unreleased] — 2026-09-29
 
+### Changed
+- **gui.py** 修正拼字功能預設模型改用 `claude-haiku-5-5`（原為 `claude-haiku-4-5-20251001`）
+- **gui.py** `_PRESET_MODELS`：新增 `claude-haiku-5-5` 和 `us.anthropic.claude-haiku-5-5` 至模型清單前方
+- **converter.py** `_bedrock_model_map`：新增 `claude-haiku-5-5` → `us.anthropic.claude-haiku-5-5` 映射
+
 ### Added
 - **converter.py** `_set_all_cell_borders(cell, color)`：對掃描 PDF 的 img2table 路徑加回灰色細線格線，還原原始表單視覺結構
 - **converter.py** `_has_table_structure(page)`：偵測 pdfplumber 頁面是否有向量格線（用於文字型 PDF 的 `show_borders` 開關）

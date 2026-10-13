@@ -1878,6 +1878,7 @@ def _call_claude_sdk_with_image(image_path: str, model: str = "",
 
     # AWS Bedrock：model id 格式不同，需轉換
     _bedrock_model_map = {
+        "claude-haiku-5-5":          "us.anthropic.claude-haiku-5-5",
         "claude-sonnet-5":           "us.anthropic.claude-sonnet-5",
         "claude-sonnet-4-6":         "us.anthropic.claude-sonnet-4-6",
         "claude-opus-5-5":           "us.anthropic.claude-opus-5-5",
